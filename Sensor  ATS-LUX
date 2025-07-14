@@ -1,0 +1,74 @@
+#include <ModbusMaster.h>
+
+#define MAX485_DE 2
+#define MAX485_RE 3
+
+#define RS485 Serial2
+
+ModbusMaster lux;
+
+void preTransmission() {
+    digitalWrite(MAX485_DE, HIGH);
+    digitalWrite(MAX485_RE, HIGH);
+    delayMicroseconds(500);  
+}
+
+void postTransmission() {
+    delayMicroseconds(500);  
+    digitalWrite(MAX485_DE, LOW);
+    digitalWrite(MAX485_RE, LOW);
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(MAX485_DE, OUTPUT);
+    pinMode(MAX485_RE, OUTPUT);
+    digitalWrite(MAX485_DE, LOW);
+    digitalWrite(MAX485_RE, LOW);
+
+    RS485.begin(9600, SERIAL_8N1);
+    delay(100);
+
+    lux.begin(2, RS485);
+    lux.preTransmission(preTransmission);
+    lux.postTransmission(postTransmission);
+}
+
+void loop() {
+    Serial.println("\nReading Light Intensity...");
+    uint8_t result;
+
+    result = lux.readInputRegisters(0x0001, 2);
+    if (result != lux.ku8MBSuccess) result = lux.readInputRegisters(0x0000, 2);
+    if (result != lux.ku8MBSuccess) result = lux.readHoldingRegisters(0x0065, 2);
+
+    if (result == lux.ku8MBSuccess) {
+        unsigned long lightLUX = (uint32_t)((lux.getResponseBuffer(1) << 16) | lux.getResponseBuffer(0));
+        Serial.println("Light Intensity: " + String(lightLUX) + " lux");
+    } else {
+        Serial.print("Error Reading ATS-LUX (Code: 0x");
+        Serial.print(result, HEX);
+        Serial.println(")");
+
+        if (result == 0xE2) {
+            Serial.println("Modbus Timeout - No response from ATS-LUX");
+        } else if (result == 0xE1) {
+            Serial.println("Incorrect Modbus Frame Received");
+        } else {
+            Serial.println("Other Modbus Error");
+        }
+
+        static uint8_t errorCount = 0;
+        errorCount++;
+        if (errorCount >= 3) {
+            Serial.println("Resetting RS485 Connection...");
+            RS485.end();
+            delay(100);
+            RS485.begin(9600, SERIAL_8N1);
+            errorCount = 0;
+        }
+    }
+
+    delay(1000);
+}
