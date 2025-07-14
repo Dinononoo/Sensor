@@ -1,0 +1,2304 @@
+#include <BlynkGOv5.h>
+
+#define MQTT_HOST     "3.25.216.166"
+#define MQTT_PORT     1883
+#define MQTT_USER     "wasuMQTT"
+#define MQTT_PASS     "123456789Za"
+
+// ประกาศฟังก์ชัน
+void setupDashboard();
+void updateAllGauges();
+void updateElectricalDisplay();
+void updateFlowDisplay();
+
+//-------------------------------------------------------------
+// สร้าง derived class (คลาสสืบต่อ) จาก GScale
+class GMyGaugeGrafana : public GScale {  
+  public:
+    GMyGaugeGrafana(GWidget &parent= GScreen) : GScale(parent) {}
+
+    uint32_t _range[5] = { 0, 40, 60, 80, 100};
+    GScaleSection section[4];
+    color_t sect_color[4] = { TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED};
+
+    GArc arc;
+    GLabel lb_value;
+    GLabel lb_title;
+    GLabel lb_unit;
+    float _value;
+    int _decimal = 0;
+    String _title_text = "Title";
+    String _unit_text = "";
+
+    void create() {
+      if(this->isCreated()) return;
+      GScale::create();
+
+      GScale::size(160, 160);
+      GScale::range(0, 100);
+      GScale::mode(SCALE_MODE_ROUND);
+      GScale::angle_offset(170);
+      GScale::angle_range(200);
+      GScale::tick_opa(0);
+      GScale::showLabel(false);
+
+      // Create background with darker color for better contrast
+      this->color(TFT_COLOR_HEX(0x181820));
+      
+      for(int i=0; i<4; i++) {
+        section[i] = GScale::add_section();
+        section[i].thickness(8, sect_color[i]);  // Increased thickness for better visibility
+        section[i].range(_range[i], _range[i+1]);
+      }
+
+      arc.parent(this);
+      arc.size(PCT(90), PCT(90));
+      arc.thickness(0.12 * GScale::width(), sect_color[0]);  // Increased thickness
+      arc.range(0, 100);
+      arc.angle_offset(GScale::angle_offset());
+      arc.angle_range(GScale::angle_range());
+      arc.bg_enable(true);
+      arc.bg_color(TFT_COLOR_HEX(0x2d2f34));  // Darker background for better contrast
+      arc.angle(0, 0);  // Start at 0
+
+      lb_value.parent(this);
+      lb_value.font(prasanmit_30);
+      lb_value.color(TFT_WHITE);
+      lb_value.align(ALIGN_CENTER);
+      lb_value = "0";
+
+      lb_title.parent(this);
+      lb_title.font(prasanmit_25);
+      lb_title.color(TFT_CYAN);
+      lb_title.align(ALIGN_TOP, 0, -35);  // Position title further above
+      lb_title = _title_text;
+
+      lb_unit.parent(this);
+      lb_unit.font(prasanmit_25);
+      lb_unit.color(TFT_WHITE);
+      lb_unit.align(ALIGN_BOTTOM, 0, 35);  // Position unit further below
+      lb_unit = _unit_text;
+    }
+
+    void setRanges(uint32_t r1, uint32_t r2, uint32_t r3, uint32_t r4, uint32_t r5) {
+      create();
+      _range[0] = r1;
+      _range[1] = r2;
+      _range[2] = r3;
+      _range[3] = r4;
+      _range[4] = r5;
+      
+      GScale::range(r1, r5);
+      arc.range(r1, r5);
+      
+      for(int i=0; i<4; i++) {
+        section[i].range(_range[i], _range[i+1]);
+      }
+    }
+
+    void setColors(color_t c1, color_t c2, color_t c3, color_t c4) {
+      create();
+      sect_color[0] = c1;
+      sect_color[1] = c2;
+      sect_color[2] = c3;
+      sect_color[3] = c4;
+      
+      for(int i=0; i<4; i++) {
+        section[i].color(sect_color[i]);
+      }
+    }
+
+    void setTitle(const char* title) {
+      create();
+      
+      // Split title and unit
+      String title_str = String(title);
+      String temp_title = title_str;
+      temp_title.trim();
+      
+      // Check for pattern like "Temperature (°C)"
+      int open_bracket = temp_title.indexOf('(');
+      int close_bracket = temp_title.indexOf(')', open_bracket);
+      
+      if (open_bracket >= 0 && close_bracket > open_bracket) {
+        // Extract title and unit separately
+        _title_text = temp_title.substring(0, open_bracket);
+        _title_text.trim();
+        
+        _unit_text = temp_title.substring(open_bracket + 1, close_bracket);
+        _unit_text.trim();
+      } else {
+        // Check for pattern like "Temperature °C"
+        int last_space = temp_title.lastIndexOf(' ');
+        if (last_space > 0 && last_space < temp_title.length() - 1) {
+          String possible_unit = temp_title.substring(last_space + 1);
+          possible_unit.trim();
+          
+          // Simple heuristic for unit detection
+          if (possible_unit.length() <= 5 || 
+              possible_unit.indexOf('%') >= 0 || 
+              possible_unit.indexOf('°') >= 0 ||
+              possible_unit.indexOf('/') >= 0) {
+            // Extract title and unit separately
+            _title_text = temp_title.substring(0, last_space);
+            _title_text.trim();
+            _unit_text = possible_unit;
+          } else {
+            _title_text = temp_title;
+            _unit_text = "";
+          }
+        } else {
+          _title_text = temp_title;
+          _unit_text = "";
+        }
+      }
+      
+      lb_title = _title_text;
+      lb_unit = _unit_text;
+    }
+
+    void setDecimal(int decimal) {
+      create();
+      _decimal = decimal;
+    }
+
+    void setTitleFont(font_t font_name, color_t color = TFT_CYAN) {
+      create();
+      lb_title.font(font_name);
+      lb_title.color(color);
+    }
+    
+    void setUnitFont(font_t font_name, color_t color = TFT_WHITE) {
+      create();
+      lb_unit.font(font_name);
+      lb_unit.color(color);
+    }
+
+    void value(float value) {
+      create();
+      _value = value;
+      
+      // Format value based on decimal places
+      if(_decimal == 0) {
+        lb_value = String((int)value);
+      } else {
+        lb_value = String(value, _decimal);
+      }
+      
+      // Calculate arc angle
+      float angle = map(constrain(value, _range[0], _range[4]), _range[0], _range[4], 0, GScale::angle_range());
+      arc.angle(0, angle);
+      
+      // Adjust arc color based on value range
+      for(int i=1; i<=4; i++) {
+        if(value <= _range[i]) {
+          arc.color(sect_color[i-1]);
+          break;
+        }
+      }
+    }
+    
+    inline float value() { create(); return _value; }
+    void operator=(float val) { value(val); }
+};
+//-------------------------------------------------------------
+
+// ประกาศรูปภาพทั้งหมด
+IMAGE_DECLARE(img_bg1);
+IMAGE_DECLARE(img_logo);
+IMAGE_DECLARE(img_home);  // รูปภาพบ้านสำหรับปุ่มกลับหน้าหลัก
+IMAGE_DECLARE(img_next);  // รูปภาพสำหรับปุ่มถัดไป
+IMAGE_DECLARE(img_back);  // รูปภาพสำหรับปุ่มย้อนกลับ
+
+// ประกาศตัวแปรส่วนกลางสำหรับการอัพเดทข้อมูล
+GLabel *p_lb_temp;
+GLabel *p_lb_humid;
+GLabel *p_lb_light;
+GLabel *p_lb_soil;
+
+// ประกาศตัวแปรเก็บค่าเซนเซอร์
+float co2_value = 0.0;
+float air_temp_value = 0.0;
+float humidity_value = 0.0;
+float light_value = 0.0;
+float water_level_value = 0.0;
+float water_temp_value = 0.0;
+float ec_value = 0.0;
+float water_ph_value = 0.0;
+
+// เพิ่มตัวแปรสำหรับค่า Flow Rate และ Total Liters
+float flow_rate1_value = 0.0;
+float flow_rate2_value = 0.0;
+float flow_rate3_value = 0.0;
+float total_liters1_value = 0.0;
+float total_liters2_value = 0.0;
+float total_liters3_value = 0.0;
+
+// เพิ่มตัวแปรสำหรับค่าไฟฟ้า
+float voltage_value = 0.0;
+float current_value = 0.0;
+float power_value = 0.0;
+float energy_value = 0.0;
+float frequency_value = 0.0;
+float pf_value = 0.0;
+
+// สร้างวิดเจ็ตหลัก
+GImage background(img_bg1);
+GImage logo(img_logo);
+GWiFiManager wifi_manager;
+GLabel lb_clock;
+GLabel lb_title;
+GButton btn_view_sensor;
+
+// หน้าจอเซนเซอร์
+GRect screen_sensor;
+GGaugeRainbow gauge(screen_sensor);
+GImageButton btn_home_sensor;
+
+// เพิ่มหน้าจอ 1, 2, 3 และปุ่มควบคุม
+GRect screen_1;
+GRect screen_2;
+GRect screen_3;
+
+GImageButton btn_next_1, btn_next_2;
+GImageButton btn_back_2, btn_back_3;
+GImageButton btn_home_1, btn_home_2, btn_home_3;
+
+// วิดเจ็ต GMyGaugeGrafana สำหรับแสดงค่าเซนเซอร์ screen 1
+GMyGaugeGrafana gauge_co2;
+GMyGaugeGrafana gauge_air_temp;
+GMyGaugeGrafana gauge_humidity;
+GMyGaugeGrafana gauge_light;
+GMyGaugeGrafana gauge_ec;
+GMyGaugeGrafana gauge_water_ph;
+GMyGaugeGrafana gauge_water_temp;
+
+// ตัวแปรสำหรับแสดงค่าเซนเซอร์บน screen_1 แบบ GLabel
+// CO2
+GRect bg_co2;
+GLabel lb_co2_title, lb_co2_value, lb_co2_unit;
+// อุณหภูมิอากาศ
+GRect bg_air_temp;
+GLabel lb_air_temp_title, lb_air_temp_value, lb_air_temp_unit;
+// ความชื้นอากาศ
+GRect bg_humidity;
+GLabel lb_humidity_title, lb_humidity_value, lb_humidity_unit;
+// ความเข้มแสง
+GRect bg_light;
+GLabel lb_light_title, lb_light_value, lb_light_unit;
+// ค่าการนำไฟฟ้า
+GRect bg_ec;
+GLabel lb_ec_title, lb_ec_value, lb_ec_unit;
+// ค่า pH
+GRect bg_water_ph;
+GLabel lb_water_ph_title, lb_water_ph_value, lb_water_ph_unit;
+// อุณหภูมิน้ำ
+GRect bg_water_temp;
+GLabel lb_water_temp_title, lb_water_temp_value, lb_water_temp_unit;
+// เวลาอัปเดตล่าสุด
+GLabel lb_sensor_last_update;
+
+// เกจวัดสำหรับ screen 2 - ระบบน้ำ - เปลี่ยนเป็น Labels แทน
+// GMyGaugeGrafana gauge_water_level;
+// GMyGaugeGrafana gauge_flow_rate1;
+// GMyGaugeGrafana gauge_flow_rate2;
+// GMyGaugeGrafana gauge_flow_rate3;
+// GMyGaugeGrafana gauge_total_liters1;
+// GMyGaugeGrafana gauge_total_liters2;
+// GMyGaugeGrafana gauge_total_liters3;
+
+// Labels สำหรับ screen 3 - ระบบไฟฟ้า - ลบออกแล้ว ใช้แค่ labels
+// GMyGaugeGrafana gauge_voltage;
+// GMyGaugeGrafana gauge_current;
+// GMyGaugeGrafana gauge_power;
+// GMyGaugeGrafana gauge_energy;
+// GMyGaugeGrafana gauge_frequency;
+// GMyGaugeGrafana gauge_pf;
+
+// Labels สำหรับ screen 3 - ระบบไฟฟ้า (แสดงเป็น labels แทน gauges)
+GLabel lb_voltage_title, lb_voltage_display, lb_voltage_unit_label;
+GLabel lb_current_title, lb_current_display, lb_current_unit_label;
+GLabel lb_power_title, lb_power_display, lb_power_unit_label;
+GLabel lb_energy_title, lb_energy_display, lb_energy_unit_label;
+GLabel lb_frequency_title, lb_frequency_display, lb_frequency_unit_label;
+GLabel lb_powerfactor_title, lb_powerfactor_display, lb_powerfactor_unit_label;
+GLabel lb_electrical_last_update;
+
+// ประกาศเพิ่มตัวแปรสำหรับหน้าจอแสดงผลใหม่
+GRect screen_dashboard;
+GImage img_bg_dashboard;
+GLabel lb_dashboard_title;
+GLabel lb_clock_dashboard;
+GLabel lb_date_dashboard;
+
+// สำหรับเกจวัดแถวบนแดชบอร์ด
+GMyGaugeGrafana gauge_row1[4];
+GMyGaugeGrafana gauge_row2[4];
+
+// สำหรับกราฟวงกลม
+GChart pie_chart;
+GSlider slider_control;
+
+// สำหรับปุ่มควบคุม
+GContainer container_buttons;
+GButton btn_pump1, btn_pump2, btn_light, btn_fan;
+
+// Labels สำหรับ screen 2 - ระบบน้ำ (แสดงเป็น labels แทน gauges)
+GLabel lb_water_level_title, lb_water_level_display, lb_water_level_unit_label;
+GLabel lb_flow_rate1_title, lb_flow_rate1_display, lb_flow_rate1_unit_label;
+GLabel lb_flow_rate2_title, lb_flow_rate2_display, lb_flow_rate2_unit_label;
+GLabel lb_flow_rate3_title, lb_flow_rate3_display, lb_flow_rate3_unit_label;
+GLabel lb_total_liters1_title, lb_total_liters1_display, lb_total_liters1_unit_label;
+GLabel lb_total_liters2_title, lb_total_liters2_display, lb_total_liters2_unit_label;
+GLabel lb_total_liters3_title, lb_total_liters3_display, lb_total_liters3_unit_label;
+GLabel lb_flow_last_update;
+
+// ตัวแปรสำหรับแสดงสถานะน้ำ
+GCircle water_level_circle;
+GLabel lb_water_level_status;
+
+void setup() {
+  Serial.begin(115200); // เพิ่มความเร็ว Serial เพื่อดีบัก
+  Serial.println("BeeNeXT5 Starting...");
+  
+  // กำหนดค่าเริ่มต้นเป็น 0 เพื่อให้แสดงสถานะน้ำหมด
+  water_level_value = 0;
+  Serial.printf("Initial water_level_value: %.1f\n", water_level_value);
+  
+  BlynkGO.begin();
+  
+  // กำหนดค่าสถานะน้ำให้เป็นสีแดงเมื่อเริ่มต้น
+  Serial.println("Setting initial water level status to RED (Empty)");
+  
+  // ทดสอบจอแสดงผลเบื้องต้น
+  Serial.println("Display test sequence...");
+  
+  // ทดสอบเคลียร์จอให้เป็นสีแดงทั้งหมด
+  BlynkGO.fillScreen(TFT_RED);
+  Serial.println("Screen filled RED");
+  delay(1000);
+  
+  // เปลี่ยนเป็นสีเขียว
+  BlynkGO.fillScreen(TFT_GREEN);
+  Serial.println("Screen filled GREEN");
+  delay(1000);
+  
+  // เปลี่ยนเป็นสีน้ำเงิน
+  BlynkGO.fillScreen(TFT_BLUE);
+  Serial.println("Screen filled BLUE");
+  delay(1000);
+  
+  // ปรับความสว่างหน้าจอเป็นค่าสูงสุด
+  BlynkGO.brightness(255);
+  Serial.println("Brightness set to maximum");
+  
+  // กลับไปที่สีดำเพื่อเริ่มต้นแอป
+  BlynkGO.fillScreen(TFT_BLACK);
+  Serial.println("Display test complete, starting main application");
+
+  // พื้นหลัก
+  background.size(800, 480);
+  background.position(0, 0);
+
+  // โลโก้
+  logo.size(400, 150);
+  logo.align(ALIGN_TOP, 0, 20);
+
+  // หัวข้อหลัก
+  lb_title = "Greenoak Intelligent IoT Farming for Crop Automation";
+  lb_title.font(prasanmit_40);
+  lb_title.color(TFT_WHITE);
+  lb_title.align(logo, ALIGN_BOTTOM, 0, -10);
+
+  // เงาซ้อนข้อความ
+  GLabel lb_title_shadow(background);
+  lb_title_shadow = lb_title.text();
+  lb_title_shadow.font(prasanmit_40);
+  lb_title_shadow.color(TFT_BLACK);
+  lb_title_shadow.align(lb_title, ALIGN_CENTER, 1, 1);
+  lb_title.toForeground();
+
+  // WiFi และนาฬิกา
+  wifi_manager.align(ALIGN_TOP_RIGHT, -20, 20);
+  lb_clock.align(wifi_manager, ALIGN_LEFT, -10);
+  lb_clock.font(prasanmit_30);
+  lb_clock.color(TFT_WHITE);
+
+  // MQTT
+  MQTT.setServer(MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS);
+  MQTT.subscribe("/myBeeNeXT/SENSOR");
+  // เพิ่มการ subscribe topic สำหรับรับข้อมูลจาก ESP32-S3
+  MQTT.subscribe("cabinets/cab_tok_001/data");
+  
+  MQTT.onMessage([](String topic, String message) {
+    Serial.printf("[MQTT] onMessage : %s --> %s\n", topic.c_str(), message.c_str());
+    
+    // จัดการข้อมูลจาก topic cabinets/cab_tok_001/data (JSON format)
+    if (topic == "cabinets/cab_tok_001/data") {
+      // รูปแบบข้อมูลจริงจาก ESP32-S3:
+      // {"cabinet_id":"cab_tok_001","sensor":"CO2","value":442,"timestamp":1747993407}
+      // {"cabinet_id":"cab_tok_001","sensor":"Air_Humidity_Temperature","value":{"humidity":36.20000076,"temperature":28.20000076},"timestamp":1747993407}
+      
+      // หา sensor name
+      int sensorStart = message.indexOf("\"sensor\":\"") + 10;
+      int sensorEnd = message.indexOf("\"", sensorStart);
+      String sensor = message.substring(sensorStart, sensorEnd);
+      
+      Serial.printf("[MQTT] Parsing sensor: %s\n", sensor.c_str());
+      
+       // ตรวจสอบประเภทเซ็นเซอร์และอัปเดตค่า
+      if (sensor == "CO2") {
+        // หา value สำหรับ CO2
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          co2_value = value;
+          gauge_co2 = co2_value;
+          lb_co2_value = String(co2_value, 0) + " ppm";
+          Serial.printf("Updated CO2: %.0f ppm\n", co2_value);
+        }
+      }
+      else if (sensor == "Light") {
+        // หา value สำหรับ Light
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          light_value = value;
+          gauge_light = light_value;
+          lb_light_value = String(light_value, 0) + " lux";
+          Serial.printf("Updated Light: %.0f lux\n", light_value);
+        }
+      }
+      else if (sensor == "EC") {
+        // หา value สำหรับ EC
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          ec_value = value;
+          gauge_ec = ec_value;
+          lb_ec_value = String(ec_value, 1) + " mS/cm";
+          Serial.printf("Updated EC: %.2f mS/cm\n", ec_value);
+        }
+      }
+      else if (sensor == "Water_Level") {
+        // หา value สำหรับ Water_Level
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          
+          // แปลงค่า 0 = น้ำหมด, 1 = น้ำเต็ม
+          if (value == 0) {
+            water_level_value = 0;
+            water_level_circle.color(TFT_RED);
+            lb_water_level_status = "น้ำหมด";
+          } else {
+            water_level_value = 100;
+            water_level_circle.color(TFT_GREEN);
+            lb_water_level_status = "น้ำเต็ม";
+          }
+          
+          Serial.printf("Updated Water Level: %.0f%% (%s)\n", water_level_value, lb_water_level_status.text().c_str());
+        }
+      }
+      else if (sensor == "Air_Humidity_Temperature") {
+        // Parse nested JSON: {"humidity":36.20000076,"temperature":28.20000076}
+        int humidityStart = message.indexOf("\"humidity\":");
+        if (humidityStart >= 0) {
+          humidityStart += 11;
+          while (humidityStart < message.length() && (message.charAt(humidityStart) == ' ' || message.charAt(humidityStart) == ':')) {
+            humidityStart++;
+          }
+          int humidityEnd = humidityStart;
+          while (humidityEnd < message.length() && message.charAt(humidityEnd) != ',' && message.charAt(humidityEnd) != '}') {
+            humidityEnd++;
+          }
+          humidity_value = message.substring(humidityStart, humidityEnd).toFloat();
+          gauge_humidity = humidity_value;
+          lb_humidity_value = String(humidity_value, 0) + " %";
+          Serial.printf("Updated Air Humidity: %.1f%%\n", humidity_value);
+        }
+        
+        int tempStart = message.indexOf("\"temperature\":");
+        if (tempStart >= 0) {
+          tempStart += 14;
+          while (tempStart < message.length() && (message.charAt(tempStart) == ' ' || message.charAt(tempStart) == ':')) {
+            tempStart++;
+          }
+          int tempEnd = tempStart;
+          while (tempEnd < message.length() && message.charAt(tempEnd) != ',' && message.charAt(tempEnd) != '}') {
+            tempEnd++;
+          }
+          air_temp_value = message.substring(tempStart, tempEnd).toFloat();
+          gauge_air_temp = air_temp_value;
+          lb_air_temp_value = String(air_temp_value, 1) + " °C";
+          Serial.printf("Updated Air Temperature: %.1f°C\n", air_temp_value);
+        }
+      }
+      else if (sensor == "Water_Temp_PH") {
+        // Parse nested JSON: {"temperature":24.39999962,"ph":8.600000381}
+        int tempStart = message.indexOf("\"temperature\":");
+        if (tempStart >= 0) {
+          tempStart += 14;
+          while (tempStart < message.length() && (message.charAt(tempStart) == ' ' || message.charAt(tempStart) == ':')) {
+            tempStart++;
+          }
+          int tempEnd = tempStart;
+          while (tempEnd < message.length() && message.charAt(tempEnd) != ',' && message.charAt(tempEnd) != '}') {
+            tempEnd++;
+          }
+          water_temp_value = message.substring(tempStart, tempEnd).toFloat();
+          gauge_water_temp = water_temp_value;
+          lb_water_temp_value = String(water_temp_value, 1) + " °C";
+          Serial.printf("Updated Water Temperature: %.1f°C\n", water_temp_value);
+        }
+        
+        int phStart = message.indexOf("\"ph\":");
+        if (phStart >= 0) {
+          phStart += 5;
+          while (phStart < message.length() && (message.charAt(phStart) == ' ' || message.charAt(phStart) == ':')) {
+            phStart++;
+          }
+          int phEnd = phStart;
+          while (phEnd < message.length() && message.charAt(phEnd) != ',' && message.charAt(phEnd) != '}') {
+            phEnd++;
+          }
+          water_ph_value = message.substring(phStart, phEnd).toFloat();
+          gauge_water_ph = water_ph_value;
+          lb_water_ph_value = String(water_ph_value, 1) + " pH";
+          Serial.printf("Updated Water pH: %.1f\n", water_ph_value);
+        }
+      }
+      else if (sensor == "PowerMeter") {
+        // Parse nested JSON: {"voltage":227.3000031,"current":0,"power":0,"energy":0.028999999,"frequency":50,"pf":0}
+        int voltageStart = message.indexOf("\"voltage\":");
+        if (voltageStart >= 0) {
+          voltageStart += 10;
+          while (voltageStart < message.length() && (message.charAt(voltageStart) == ' ' || message.charAt(voltageStart) == ':')) {
+            voltageStart++;
+          }
+          int voltageEnd = voltageStart;
+          while (voltageEnd < message.length() && message.charAt(voltageEnd) != ',' && message.charAt(voltageEnd) != '}') {
+            voltageEnd++;
+          }
+          voltage_value = message.substring(voltageStart, voltageEnd).toFloat();
+          Serial.printf("Updated Voltage: %.1f V\n", voltage_value);
+        }
+        
+        int currentStart = message.indexOf("\"current\":");
+        if (currentStart >= 0) {
+          currentStart += 10;
+          while (currentStart < message.length() && (message.charAt(currentStart) == ' ' || message.charAt(currentStart) == ':')) {
+            currentStart++;
+          }
+          int currentEnd = currentStart;
+          while (currentEnd < message.length() && message.charAt(currentEnd) != ',' && message.charAt(currentEnd) != '}') {
+            currentEnd++;
+          }
+          current_value = message.substring(currentStart, currentEnd).toFloat();
+          Serial.printf("Updated Current: %.1f A\n", current_value);
+        }
+        
+        int powerStart = message.indexOf("\"power\":");
+        if (powerStart >= 0) {
+          powerStart += 8;
+          while (powerStart < message.length() && (message.charAt(powerStart) == ' ' || message.charAt(powerStart) == ':')) {
+            powerStart++;
+          }
+          int powerEnd = powerStart;
+          while (powerEnd < message.length() && message.charAt(powerEnd) != ',' && message.charAt(powerEnd) != '}') {
+            powerEnd++;
+          }
+          power_value = message.substring(powerStart, powerEnd).toFloat();
+          Serial.printf("Updated Power: %.1f W\n", power_value);
+        }
+        
+        int energyStart = message.indexOf("\"energy\":");
+        if (energyStart >= 0) {
+          energyStart += 9;
+          while (energyStart < message.length() && (message.charAt(energyStart) == ' ' || message.charAt(energyStart) == ':')) {
+            energyStart++;
+          }
+          int energyEnd = energyStart;
+          while (energyEnd < message.length() && message.charAt(energyEnd) != ',' && message.charAt(energyEnd) != '}') {
+            energyEnd++;
+          }
+          energy_value = message.substring(energyStart, energyEnd).toFloat();
+          Serial.printf("Updated Energy: %.3f kWh\n", energy_value);
+        }
+        
+        int frequencyStart = message.indexOf("\"frequency\":");
+        if (frequencyStart >= 0) {
+          frequencyStart += 12;
+          while (frequencyStart < message.length() && (message.charAt(frequencyStart) == ' ' || message.charAt(frequencyStart) == ':')) {
+            frequencyStart++;
+          }
+          int frequencyEnd = frequencyStart;
+          while (frequencyEnd < message.length() && message.charAt(frequencyEnd) != ',' && message.charAt(frequencyEnd) != '}') {
+            frequencyEnd++;
+          }
+          frequency_value = message.substring(frequencyStart, frequencyEnd).toFloat();
+          Serial.printf("Updated Frequency: %.1f Hz\n", frequency_value);
+        }
+        
+        int pfStart = message.indexOf("\"pf\":");
+        if (pfStart >= 0) {
+          pfStart += 5;
+          while (pfStart < message.length() && (message.charAt(pfStart) == ' ' || message.charAt(pfStart) == ':')) {
+            pfStart++;
+          }
+          int pfEnd = pfStart;
+          while (pfEnd < message.length() && message.charAt(pfEnd) != ',' && message.charAt(pfEnd) != '}') {
+            pfEnd++;
+          }
+          pf_value = message.substring(pfStart, pfEnd).toFloat();
+          Serial.printf("Updated Power Factor: %.2f\n", pf_value);
+        }
+        
+        // อัปเดตการแสดงผล
+        updateElectricalDisplay();
+      }
+      else if (sensor == "FlowSensor1_LPM") {
+        // หา value สำหรับ FlowSensor1_LPM
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          flow_rate1_value = value;
+          Serial.printf("Updated Flow Rate 1: %.1f L/min\n", flow_rate1_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else if (sensor == "FlowSensor2_LPM") {
+        // หา value สำหรับ FlowSensor2_LPM
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          flow_rate2_value = value;
+          Serial.printf("Updated Flow Rate 2: %.1f L/min\n", flow_rate2_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else if (sensor == "FlowSensor3_LPM") {
+        // หา value สำหรับ FlowSensor3_LPM
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          flow_rate3_value = value;
+          Serial.printf("Updated Flow Rate 3: %.1f L/min\n", flow_rate3_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else if (sensor == "FlowSensor1_Liters") {
+        // หา value สำหรับ FlowSensor1_Liters
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          total_liters1_value = value;
+          Serial.printf("Updated Total Liters 1: %.1f L\n", total_liters1_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else if (sensor == "FlowSensor2_Liters") {
+        // หา value สำหรับ FlowSensor2_Liters
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          total_liters2_value = value;
+          Serial.printf("Updated Total Liters 2: %.1f L\n", total_liters2_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else if (sensor == "FlowSensor3_Liters") {
+        // หา value สำหรับ FlowSensor3_Liters
+        int valueStart = message.indexOf("\"value\":");
+        if (valueStart >= 0) {
+          valueStart += 8;
+          while (valueStart < message.length() && (message.charAt(valueStart) == ' ' || message.charAt(valueStart) == ':')) {
+            valueStart++;
+          }
+          int valueEnd = valueStart;
+          while (valueEnd < message.length() && message.charAt(valueEnd) != ',' && message.charAt(valueEnd) != '}') {
+            valueEnd++;
+          }
+          float value = message.substring(valueStart, valueEnd).toFloat();
+          total_liters3_value = value;
+          Serial.printf("Updated Total Liters 3: %.1f L\n", total_liters3_value);
+          updateFlowDisplay(); // อัปเดตการแสดงผลทันที
+        }
+      }
+      else {
+        Serial.printf("[MQTT] Unknown sensor: %s\n", sensor.c_str());
+      }
+      
+      // อัปเดตค่าในแดชบอร์ด
+      updateAllGauges();
+    }
+    // จัดการข้อมูลจาก topic เดิม /myBeeNeXT/SENSOR
+    else if (topic == "/myBeeNeXT/SENSOR") {
+      float sensor_value = message.toFloat();
+      gauge = sensor_value;
+      if (topic.indexOf("temp") > 0 && p_lb_temp != NULL) {
+        *p_lb_temp = "อุณหภูมิ: " + String(sensor_value, 1) + " °C";
+        air_temp_value = sensor_value;
+        gauge_air_temp = air_temp_value;
+      } else if (topic.indexOf("humid") > 0 && p_lb_humid != NULL) {
+        *p_lb_humid = "ความชื้น: " + String(sensor_value, 0) + "%";
+        humidity_value = sensor_value;
+        gauge_humidity = humidity_value;
+      } else if (topic.indexOf("light") > 0 && p_lb_light != NULL) {
+        *p_lb_light = "ความเข้มแสง: " + String(sensor_value, 0) + " lux";
+        light_value = sensor_value;
+        gauge_light = light_value;
+      } else if (topic.indexOf("soil") > 0 && p_lb_soil != NULL) {
+        *p_lb_soil = "ความชื้นดิน: " + String(sensor_value, 0) + "%";
+      } else if (topic.indexOf("co2") > 0) {
+        co2_value = sensor_value;
+        gauge_co2 = co2_value;
+      } else if (topic.indexOf("ec") > 0) {
+        ec_value = sensor_value;
+        gauge_ec = ec_value;
+      } else if (topic.indexOf("water_ph") > 0) {
+        water_ph_value = sensor_value;
+        gauge_water_ph = water_ph_value;
+      } else if (topic.indexOf("water_temp") > 0) {
+        water_temp_value = sensor_value;
+        gauge_water_temp = water_temp_value;
+      }
+    }
+  });
+
+  // ปุ่มดูข้อมูลเซนเซอร์หน้าหลัก -> screen_1
+  btn_view_sensor = "ดูข้อมูลเซนเซอร์";
+  btn_view_sensor.parent(background);
+  btn_view_sensor.size(300, 60);
+  btn_view_sensor.corner_radius(15);
+  btn_view_sensor.color(TFT_PALETTE_BLUE);  // สีน้ำเงินจากพาเลต TFT_PALETTE
+  btn_view_sensor.font(prasanmit_30);
+  btn_view_sensor.font_color(TFT_WHITE);
+  btn_view_sensor.shadow(2);  // ลดเงาให้ดูทันสมัย
+  btn_view_sensor.padding(10);  // เพิ่มระยะห่างภายใน
+  btn_view_sensor.align(lb_title, ALIGN_BOTTOM, 0, 80);
+  btn_view_sensor.show(true);
+  btn_view_sensor.onClicked(GWIDGET_CB {
+    screen_1.show(true);
+    background.show(false);
+    // กำหนดสีวงกลมแสดงสถานะน้ำให้เป็นสีแดงทุกครั้งที่เปิดหน้า screen_1
+    water_level_circle.color(TFT_RED);
+    lb_water_level_status = "น้ำหมด";
+  });
+
+  // ตั้งค่า screen_1 - เซนเซอร์สภาพแวดล้อมและคุณภาพน้ำ
+  screen_1.size(800, 480);
+  screen_1.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  screen_1.show(false);
+  
+  // กำหนดตำแหน่ง Y สำหรับแต่ละแถว - เพิ่มระยะห่างเพื่อให้อ่านง่าย
+  int row1_y = 90;  // แถวบน (เดิม 120)
+  int row2_y = 260;  // แถวล่าง (เดิม 320)
+  
+  // สร้างวงกลมแสดงสถานะน้ำและข้อความ ในตำแหน่งที่เหมาะสม
+  water_level_circle.parent(screen_1);
+  water_level_circle.size(120, 120); // เพิ่มขนาดจาก 100 เป็น 120
+  water_level_circle.position(600, 260); // ปรับตำแหน่ง X จาก 530 เป็น 600
+  water_level_circle.color(TFT_RED); // กำหนดเป็นสีแดงคงที่
+  water_level_circle.bg_color(TFT_COLOR_HEX(0x181820));
+  water_level_circle.bg_opa(255);
+  
+  // สร้าง Label แสดงข้อความสถานะน้ำ
+  lb_water_level_status.parent(screen_1);
+  lb_water_level_status = "น้ำหมด"; // กำหนดข้อความคงที่
+  lb_water_level_status.font(prasanmit_30);
+  lb_water_level_status.color(TFT_WHITE);
+  lb_water_level_status.align(water_level_circle, ALIGN_CENTER, 0, 0);
+  
+  // สร้างหัวข้อสำหรับหน้า screen_1
+  GLabel lb_screen1_title(screen_1);
+  lb_screen1_title = "เซนเซอร์สภาพแวดล้อมและคุณภาพน้ำ";
+  lb_screen1_title.font(prasanmit_40);
+  lb_screen1_title.color(TFT_WHITE);
+  lb_screen1_title.align(ALIGN_TOP, 0, 20);
+  
+  // เพิ่มเงาสำหรับชื่อหน้าจอเพื่อให้อ่านชัดเจนยิ่งขึ้น
+  GLabel lb_screen1_title_shadow(screen_1);
+  lb_screen1_title_shadow = lb_screen1_title.text();
+  lb_screen1_title_shadow.font(prasanmit_40);
+  lb_screen1_title_shadow.color(TFT_BLACK);
+  lb_screen1_title_shadow.align(lb_screen1_title, ALIGN_CENTER, 1, 1);
+  lb_screen1_title.toForeground();
+  
+  // กำหนดตำแหน่งเกจแบบตาราง 4x2 สำหรับความชัดเจนและสมดุล
+  int margin_x = 60;  // ระยะห่างจากขอบซ้าย-ขวา
+  int gauge_width = 160; // ขนาดเกจให้ใหญ่พอสำหรับอ่านค่าชัดเจน
+  
+  // คำนวณระยะห่างระหว่างเกจอัตโนมัติ
+  int spacing_x = (800 - 2 * margin_x - 4 * gauge_width) / 3;  // ระยะห่างระหว่างเกจในแนวนอน
+  
+  // คำนวณตำแหน่ง X สำหรับเกจแต่ละคอลัมน์
+  int col1_x = margin_x;  // คอลัมน์ 1 (ซ้ายสุด)
+  int col2_x = margin_x + gauge_width + spacing_x;  // คอลัมน์ 2
+  int col3_x = margin_x + 2 * (gauge_width + spacing_x);  // คอลัมน์ 3
+  int col4_x = margin_x + 3 * (gauge_width + spacing_x);  // คอลัมน์ 4 (ขวาสุด)
+  
+  // ตั้งค่า GMyGaugeGrafana สำหรับ CO2
+  gauge_co2.parent(screen_1);
+  gauge_co2.size(gauge_width, gauge_width);
+  gauge_co2.position(col1_x, row1_y);
+  gauge_co2.setRanges(0, 400, 700, 1000, 1500);
+  gauge_co2.setColors(TFT_GREEN, TFT_BLUE, TFT_YELLOW, TFT_RED);
+  gauge_co2.setTitle("Co2 (ppm)");
+  gauge_co2.setDecimal(0);
+  
+  // ตั้งค่าฟอนต์ขนาดใหญ่ขึ้นและตำแหน่งที่ชัดเจน
+  gauge_co2.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_co2.setUnitFont(prasanmit_25, TFT_WHITE);
+  
+  // กำหนดค่าเริ่มต้น
+  gauge_co2 = co2_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_co2_title_shadow(screen_1);
+  lb_co2_title_shadow = gauge_co2.lb_title.text();
+  lb_co2_title_shadow.font(prasanmit_30);
+  lb_co2_title_shadow.color(TFT_BLACK);
+  lb_co2_title_shadow.align(gauge_co2.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_co2.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - CO2
+  bg_co2.parent(screen_1);
+  bg_co2.size(gauge_width, gauge_width);
+  bg_co2.position(col1_x, row1_y);
+  bg_co2.color(TFT_COLOR_HEX(0x181820));
+  bg_co2.corner_radius(10);
+
+  lb_co2_title.parent(screen_1);
+  lb_co2_title = "Co2";
+  lb_co2_title.font(prasanmit_30);
+  lb_co2_title.color(TFT_CYAN);
+  lb_co2_title.position(col1_x + gauge_width - 100, row1_y + 25); // ขยับไปฝั่งซ้ายอีกนิด
+  lb_co2_title.text_align(TEXT_ALIGN_RIGHT); // เปลี่ยนเป็นชิดขวา
+
+  lb_co2_value.parent(screen_1);
+  lb_co2_value = String(co2_value, 0) + " ppm";
+  lb_co2_value.font(prasanmit_40);
+  lb_co2_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_co2_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_co2_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_co2_value.bg_opa(255); // ความทึบ 100%
+  lb_co2_value.corner_radius(5); // มุมโค้ง
+  lb_co2_value.padding(5);
+  lb_co2_value.position(col1_x + gauge_width/2 - 75, row1_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_co2_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_co2_unit เนื่องจากนำหน่วยไปแสดงใน lb_co2_value แล้ว
+  lb_co2_unit.hidden(true);
+
+  lb_co2_unit.parent(screen_1);
+  lb_co2_unit = "ppm";
+  lb_co2_unit.font(prasanmit_25);
+  lb_co2_unit.color(TFT_WHITE);
+  lb_co2_unit.position(col1_x + gauge_width/2 + 65, row1_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_co2_unit.text_align(TEXT_ALIGN_LEFT);
+
+  // ตั้งค่า GMyGaugeGrafana สำหรับ Air Temperature
+  gauge_air_temp.parent(screen_1);
+  gauge_air_temp.size(gauge_width, gauge_width);
+  gauge_air_temp.position(col2_x, row1_y);
+  gauge_air_temp.setRanges(0, 15, 25, 35, 50);
+  gauge_air_temp.setColors(TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED);
+  gauge_air_temp.setTitle("อุณหภูมิอากาศ (°C)");
+  gauge_air_temp.setDecimal(1);
+  gauge_air_temp.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_air_temp.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_air_temp = air_temp_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_air_temp_title_shadow(screen_1);
+  lb_air_temp_title_shadow = gauge_air_temp.lb_title.text();
+  lb_air_temp_title_shadow.font(prasanmit_30);
+  lb_air_temp_title_shadow.color(TFT_BLACK);
+  lb_air_temp_title_shadow.align(gauge_air_temp.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_air_temp.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - อุณหภูมิอากาศ
+  bg_air_temp.parent(screen_1);
+  bg_air_temp.size(gauge_width, gauge_width);
+  bg_air_temp.position(col2_x, row1_y);
+  bg_air_temp.color(TFT_COLOR_HEX(0x181820));
+  bg_air_temp.corner_radius(10);
+
+  lb_air_temp_title.parent(screen_1);
+  lb_air_temp_title = "อุณหภูมิอากาศ";
+  lb_air_temp_title.font(prasanmit_30);
+  lb_air_temp_title.color(TFT_CYAN);
+  lb_air_temp_title.position(col2_x + 15, row1_y + 25); // ขยับไปฝั่งซ้ายมากขึ้น
+  lb_air_temp_title.text_align(TEXT_ALIGN_LEFT); // เปลี่ยนเป็นชิดซ้าย
+
+  lb_air_temp_value.parent(screen_1);
+  lb_air_temp_value = String(air_temp_value, 1) + " °C";
+  lb_air_temp_value.font(prasanmit_40);
+  lb_air_temp_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_air_temp_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_air_temp_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_air_temp_value.bg_opa(255); // ความทึบ 100%
+  lb_air_temp_value.corner_radius(5);
+  lb_air_temp_value.padding(5);
+  lb_air_temp_value.position(col2_x + gauge_width/2 - 75, row1_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_air_temp_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_air_temp_unit เนื่องจากนำหน่วยไปแสดงใน lb_air_temp_value แล้ว
+  lb_air_temp_unit.hidden(true);
+
+  lb_air_temp_unit.parent(screen_1);
+  lb_air_temp_unit = "°C";
+  lb_air_temp_unit.font(prasanmit_25);
+  lb_air_temp_unit.color(TFT_WHITE);
+  lb_air_temp_unit.position(col2_x + gauge_width/2 + 65, row1_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_air_temp_unit.text_align(TEXT_ALIGN_LEFT);
+
+  // ตั้งค่า GMyGaugeGrafana สำหรับ Humidity
+  gauge_humidity.parent(screen_1);
+  gauge_humidity.size(gauge_width, gauge_width);
+  gauge_humidity.position(col3_x, row1_y);
+  gauge_humidity.setRanges(0, 30, 50, 70, 100);
+  gauge_humidity.setColors(TFT_RED, TFT_YELLOW, TFT_GREEN, TFT_BLUE);
+  gauge_humidity.setTitle("ความชื้นอากาศ (%)");
+  gauge_humidity.setDecimal(0);
+  gauge_humidity.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_humidity.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_humidity = humidity_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_humidity_title_shadow(screen_1);
+  lb_humidity_title_shadow = gauge_humidity.lb_title.text();
+  lb_humidity_title_shadow.font(prasanmit_30);
+  lb_humidity_title_shadow.color(TFT_BLACK);
+  lb_humidity_title_shadow.align(gauge_humidity.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_humidity.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - ความชื้นอากาศ
+  bg_humidity.parent(screen_1);
+  bg_humidity.size(gauge_width, gauge_width);
+  bg_humidity.position(col3_x, row1_y);
+  bg_humidity.color(TFT_COLOR_HEX(0x181820));
+  bg_humidity.corner_radius(10);
+
+  lb_humidity_title.parent(screen_1);
+  lb_humidity_title = "ความชื้นอากาศ";
+  lb_humidity_title.font(prasanmit_30);
+  lb_humidity_title.color(TFT_CYAN);
+  lb_humidity_title.position(col3_x + 15, row1_y + 25); // ขยับไปฝั่งซ้ายมากขึ้น
+  lb_humidity_title.text_align(TEXT_ALIGN_LEFT); // เปลี่ยนเป็นชิดซ้าย
+
+  lb_humidity_value.parent(screen_1);
+  lb_humidity_value = String(humidity_value, 0) + " %";
+  lb_humidity_value.font(prasanmit_40);
+  lb_humidity_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_humidity_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_humidity_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_humidity_value.bg_opa(255); // ความทึบ 100%
+  lb_humidity_value.corner_radius(5);
+  lb_humidity_value.padding(5);
+  lb_humidity_value.position(col3_x + gauge_width/2 - 75, row1_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_humidity_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_humidity_unit เนื่องจากนำหน่วยไปแสดงใน lb_humidity_value แล้ว
+  lb_humidity_unit.hidden(true);
+
+  lb_humidity_unit.parent(screen_1);
+  lb_humidity_unit = "%";
+  lb_humidity_unit.font(prasanmit_25);
+  lb_humidity_unit.color(TFT_WHITE);
+  lb_humidity_unit.position(col3_x + gauge_width/2 + 65, row1_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_humidity_unit.text_align(TEXT_ALIGN_LEFT);
+
+  // ตั้งค่า GMyGaugeGrafana สำหรับ Light
+  gauge_light.parent(screen_1);
+  gauge_light.size(gauge_width, gauge_width);
+  gauge_light.position(col4_x, row1_y);
+  gauge_light.setRanges(0, 200, 500, 800, 1000);
+  gauge_light.setColors(TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED);
+  gauge_light.setTitle("ความเข้มแสง (lux)");
+  gauge_light.setDecimal(0);
+  gauge_light.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_light.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_light = light_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_light_title_shadow(screen_1);
+  lb_light_title_shadow = gauge_light.lb_title.text();
+  lb_light_title_shadow.font(prasanmit_30);
+  lb_light_title_shadow.color(TFT_BLACK);
+  lb_light_title_shadow.align(gauge_light.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_light.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - ความเข้มแสง
+  bg_light.parent(screen_1);
+  bg_light.size(gauge_width, gauge_width);
+  bg_light.position(col4_x, row1_y);
+  bg_light.color(TFT_COLOR_HEX(0x181820));
+  bg_light.corner_radius(10);
+
+  lb_light_title.parent(screen_1);
+  lb_light_title = "ความเข้มแสง";
+  lb_light_title.font(prasanmit_30);
+  lb_light_title.color(TFT_CYAN);
+  lb_light_title.position(col4_x + 15, row1_y + 25); // ขยับไปฝั่งซ้ายมากขึ้น
+  lb_light_title.text_align(TEXT_ALIGN_LEFT); // เปลี่ยนเป็นชิดซ้าย
+
+  lb_light_value.parent(screen_1);
+  lb_light_value = String(light_value, 0) + " lux";
+  lb_light_value.font(prasanmit_40);
+  lb_light_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_light_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_light_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_light_value.bg_opa(255); // ความทึบ 100%
+  lb_light_value.corner_radius(5);
+  lb_light_value.padding(5);
+  lb_light_value.position(col4_x + gauge_width/2 - 75, row1_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_light_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_light_unit เนื่องจากนำหน่วยไปแสดงใน lb_light_value แล้ว
+  lb_light_unit.hidden(true);
+
+  lb_light_unit.parent(screen_1);
+  lb_light_unit = "lux";
+  lb_light_unit.font(prasanmit_25);
+  lb_light_unit.color(TFT_WHITE);
+  lb_light_unit.position(col4_x + gauge_width/2 + 65, row1_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_light_unit.text_align(TEXT_ALIGN_LEFT);
+  
+  // แถวที่ 2
+  // ตั้งค่า GMyGaugeGrafana สำหรับ EC
+  gauge_ec.parent(screen_1);
+  gauge_ec.size(gauge_width, gauge_width);
+  gauge_ec.position(col1_x, row2_y);
+  gauge_ec.setRanges(0, 1, 2, 3, 4);
+  gauge_ec.setColors(TFT_GREEN, TFT_BLUE, TFT_YELLOW, TFT_RED);
+  gauge_ec.setTitle("EC (mS/cm)");
+  gauge_ec.setDecimal(1);
+  gauge_ec.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_ec.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_ec = ec_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_ec_title_shadow(screen_1);
+  lb_ec_title_shadow = gauge_ec.lb_title.text();
+  lb_ec_title_shadow.font(prasanmit_30);
+  lb_ec_title_shadow.color(TFT_BLACK);
+  lb_ec_title_shadow.align(gauge_ec.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_ec.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - EC
+  bg_ec.parent(screen_1);
+  bg_ec.size(gauge_width, gauge_width);
+  bg_ec.position(col1_x, row2_y);
+  bg_ec.color(TFT_COLOR_HEX(0x181820));
+  bg_ec.corner_radius(10);
+
+  lb_ec_title.parent(screen_1);
+  lb_ec_title = "EC";
+  lb_ec_title.font(prasanmit_30);
+  lb_ec_title.color(TFT_CYAN);
+  lb_ec_title.position(col1_x + gauge_width - 100, row2_y + 25); // ขยับไปฝั่งซ้ายอีกนิด
+  lb_ec_title.text_align(TEXT_ALIGN_RIGHT); // เปลี่ยนเป็นชิดขวา
+
+  lb_ec_value.parent(screen_1);
+  lb_ec_value = String(ec_value, 1) + " mS/cm";
+  lb_ec_value.font(prasanmit_40);
+  lb_ec_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_ec_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_ec_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_ec_value.bg_opa(255); // ความทึบ 100%
+  lb_ec_value.corner_radius(5);
+  lb_ec_value.padding(5);
+  lb_ec_value.position(col1_x + gauge_width/2 - 75, row2_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_ec_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_ec_unit เนื่องจากนำหน่วยไปแสดงใน lb_ec_value แล้ว
+  lb_ec_unit.hidden(true);
+
+  lb_ec_unit.parent(screen_1);
+  lb_ec_unit = "mS/cm";
+  lb_ec_unit.font(prasanmit_25);
+  lb_ec_unit.color(TFT_WHITE);
+  lb_ec_unit.position(col1_x + gauge_width/2 + 65, row2_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_ec_unit.text_align(TEXT_ALIGN_LEFT);
+  
+  // ตั้งค่า GMyGaugeGrafana สำหรับ Water pH
+  gauge_water_ph.parent(screen_1);
+  gauge_water_ph.size(gauge_width, gauge_width);
+  gauge_water_ph.position(col2_x, row2_y);
+  gauge_water_ph.setRanges(0, 5, 7, 9, 14);
+  gauge_water_ph.setColors(TFT_RED, TFT_YELLOW, TFT_GREEN, TFT_RED);
+  gauge_water_ph.setTitle("PH");
+  gauge_water_ph.setDecimal(1);
+  gauge_water_ph.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_water_ph.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_water_ph = water_ph_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_water_ph_title_shadow(screen_1);
+  lb_water_ph_title_shadow = gauge_water_ph.lb_title.text();
+  lb_water_ph_title_shadow.font(prasanmit_30);
+  lb_water_ph_title_shadow.color(TFT_BLACK);
+  lb_water_ph_title_shadow.align(gauge_water_ph.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_water_ph.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - Water pH
+  bg_water_ph.parent(screen_1);
+  bg_water_ph.size(gauge_width, gauge_width);
+  bg_water_ph.position(col2_x, row2_y);
+  bg_water_ph.color(TFT_COLOR_HEX(0x181820));
+  bg_water_ph.corner_radius(10);
+
+  lb_water_ph_title.parent(screen_1);
+  lb_water_ph_title = "PH";
+  lb_water_ph_title.font(prasanmit_30);
+  lb_water_ph_title.color(TFT_CYAN);
+  lb_water_ph_title.position(col2_x + gauge_width - 100, row2_y + 25); // ขยับไปฝั่งซ้ายอีกนิด
+  lb_water_ph_title.text_align(TEXT_ALIGN_RIGHT); // เปลี่ยนเป็นชิดขวา
+
+  lb_water_ph_value.parent(screen_1);
+  lb_water_ph_value = String(water_ph_value, 1) + " pH";
+  lb_water_ph_value.font(prasanmit_40);
+  lb_water_ph_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_water_ph_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_water_ph_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_water_ph_value.bg_opa(255); // ความทึบ 100%
+  lb_water_ph_value.corner_radius(5);
+  lb_water_ph_value.padding(5);
+  lb_water_ph_value.position(col2_x + gauge_width/2 - 75, row2_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_water_ph_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_water_ph_unit เนื่องจากนำหน่วยไปแสดงใน lb_water_ph_value แล้ว
+  lb_water_ph_unit.hidden(true);
+
+  lb_water_ph_unit.parent(screen_1);
+  lb_water_ph_unit = "pH";
+  lb_water_ph_unit.font(prasanmit_25);
+  lb_water_ph_unit.color(TFT_WHITE);
+  lb_water_ph_unit.position(col2_x + gauge_width/2 + 65, row2_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_water_ph_unit.text_align(TEXT_ALIGN_LEFT);
+
+  // ตั้งค่า GMyGaugeGrafana สำหรับ Water Temperature
+  gauge_water_temp.parent(screen_1);
+  gauge_water_temp.size(gauge_width, gauge_width);
+  gauge_water_temp.position(col3_x, row2_y);
+  gauge_water_temp.setRanges(0, 15, 25, 35, 50);
+  gauge_water_temp.setColors(TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED);
+  gauge_water_temp.setTitle("อุณหภูมิน้ำ (°C)");
+  gauge_water_temp.setDecimal(1);
+  gauge_water_temp.setTitleFont(prasanmit_30, TFT_CYAN);
+  gauge_water_temp.setUnitFont(prasanmit_25, TFT_WHITE);
+  gauge_water_temp = water_temp_value;
+  
+  // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+  GLabel lb_water_temp_title_shadow(screen_1);
+  lb_water_temp_title_shadow = gauge_water_temp.lb_title.text();
+  lb_water_temp_title_shadow.font(prasanmit_30);
+  lb_water_temp_title_shadow.color(TFT_BLACK);
+  lb_water_temp_title_shadow.align(gauge_water_temp.lb_title, ALIGN_CENTER, 1, 1);
+  gauge_water_temp.lb_title.toForeground();
+
+  // แทนที่เกจด้วย GLabels - อุณหภูมิน้ำ
+  bg_water_temp.parent(screen_1);
+  bg_water_temp.size(gauge_width, gauge_width);
+  bg_water_temp.position(col3_x, row2_y);
+  bg_water_temp.color(TFT_COLOR_HEX(0x181820));
+  bg_water_temp.corner_radius(10);
+
+  lb_water_temp_title.parent(screen_1);
+  lb_water_temp_title = "อุณหภูมิน้ำ";
+  lb_water_temp_title.font(prasanmit_30);
+  lb_water_temp_title.color(TFT_CYAN);
+  lb_water_temp_title.position(col3_x + 25, row2_y + 35); // ขยับไปฝั่งซ้ายนิดนึง
+  lb_water_temp_title.text_align(TEXT_ALIGN_LEFT); // เปลี่ยนเป็นชิดซ้าย
+
+  lb_water_temp_value.parent(screen_1);
+  lb_water_temp_value = String(water_temp_value, 1) + " °C";
+  lb_water_temp_value.font(prasanmit_40);
+  lb_water_temp_value.color(TFT_BLACK); // เปลี่ยนเป็นสีดำ
+  lb_water_temp_value.size(150, 50); // เพิ่มขนาดความกว้างจาก 100 เป็น 150
+  lb_water_temp_value.bg_color(TFT_WHITE); // เปลี่ยนเป็นพื้นหลังสีขาว
+  lb_water_temp_value.bg_opa(255); // ความทึบ 100%
+  lb_water_temp_value.corner_radius(5);
+  lb_water_temp_value.padding(5);
+  lb_water_temp_value.position(col3_x + gauge_width/2 - 75, row2_y + gauge_width/2); // ปรับตำแหน่ง
+  lb_water_temp_value.text_align(TEXT_ALIGN_CENTER); // เปลี่ยนเป็นจัดกึ่งกลาง
+
+  // ซ่อน lb_water_temp_unit เนื่องจากนำหน่วยไปแสดงใน lb_water_temp_value แล้ว
+  lb_water_temp_unit.hidden(true);
+
+  lb_water_temp_unit.parent(screen_1);
+  lb_water_temp_unit = "°C";
+  lb_water_temp_unit.font(prasanmit_25);
+  lb_water_temp_unit.color(TFT_WHITE);
+  lb_water_temp_unit.position(col3_x + gauge_width/2 + 65, row2_y + gauge_width/2); // ย้ายไปฝั่งขวาของค่า
+  lb_water_temp_unit.text_align(TEXT_ALIGN_LEFT);
+  
+  // เพิ่มเวลาอัปเดตล่าสุด
+  lb_sensor_last_update.parent(screen_1);
+  lb_sensor_last_update = "อัปเดตล่าสุด: " + StringX::printf("%02d:%02d:%02d", hour(), minute(), second());
+  lb_sensor_last_update.font(prasanmit_25); // เพิ่มขนาดฟอนต์จาก 20 เป็น 25
+  lb_sensor_last_update.color(TFT_SILVER);
+  lb_sensor_last_update.align(ALIGN_BOTTOM, 0, -15); // ปรับระยะห่างจากด้านล่างจาก -10 เป็น -15
+  
+  // เพิ่มเส้นคั่นเหนือเวลาอัปเดตล่าสุด
+  GLine line_bottom_screen1(screen_1);
+  point_precise_t line_points_screen1[] = {{50, 440}, {750, 440}};
+  line_bottom_screen1.points(line_points_screen1, 2);
+  line_bottom_screen1.color(TFT_DARKGRAY);
+  line_bottom_screen1.thickness(2);
+  
+  
+  // ปุ่มถัดไป screen_1 -> screen_2
+  btn_next_1 = img_next;
+  btn_next_1.parent(screen_1);
+  btn_next_1.size(60, 48); // เปลี่ยนจาก 70, 55 เป็น 60, 48
+  btn_next_1.corner_radius(0);
+  btn_next_1.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_next_1.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_next_1.align(ALIGN_BOTTOM_RIGHT, -20, -20); // ปรับตำแหน่งจาก -30, -30 เป็น -20, -20
+  btn_next_1.show(true);
+  btn_next_1.onClicked(GWIDGET_CB {
+    screen_1.show(false);
+    screen_2.show(true);
+  });
+
+  // ปุ่มกลับหน้าหลัก screen_1
+  btn_home_1 = img_home;
+  btn_home_1.parent(screen_1);
+  btn_home_1.size(50, 50);    // เปลี่ยนจาก 60, 60 เป็น 50, 50
+  btn_home_1.corner_radius(0); // ไม่มีมุมโค้ง
+  btn_home_1.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_home_1.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_home_1.align(ALIGN_TOP_RIGHT, -15, 15); // ปรับตำแหน่งจาก -20, 20 เป็น -15, 15
+  btn_home_1.show(true);
+  btn_home_1.onClicked(GWIDGET_CB {
+    screen_1.show(false);
+    background.show(true);
+  });
+
+  // ตั้งค่า screen_2 - ระบบระดับน้ำและอัตราการไหล (ใช้ GLabel แทนเกจ)
+  screen_2.size(800, 480);
+  screen_2.color(TFT_COLOR_HEX(0x1E3A8A)); // พื้นหลังสีน้ำเงิน
+  screen_2.show(false);
+  
+  // สร้างหัวข้อสำหรับหน้า screen_2
+  GLabel lb_screen2_title(screen_2);
+  lb_screen2_title = "🌊 ระบบน้ำและการไหล 🌊";
+  lb_screen2_title.font(prasanmit_35);
+  lb_screen2_title.color(TFT_WHITE);
+  lb_screen2_title.align(ALIGN_TOP, 0, 15);
+  
+  // กำหนดตำแหน่งแบบ grid 3x2 
+  int box_width_s2 = 240;   // ความกว้างกรอบ
+  int box_height_s2 = 140;  // ความสูงกรอบ
+  int margin_x_screen2 = 20;  // เพิ่มจาก 10 เป็น 20
+  int spacing_x_screen2 = 15; // ลดระยะห่างระหว่างคอลัมน์ลงเป็น 15
+  
+  int col1_x_screen2 = margin_x_screen2;
+  int col2_x_screen2 = margin_x_screen2 + box_width_s2 + spacing_x_screen2;
+  int col3_x_screen2 = margin_x_screen2 + 2 * (box_width_s2 + spacing_x_screen2);
+  
+  int row1_y_screen2 = 80;   // แถวบน
+  int row2_y_screen2 = 260;  // แถวล่าง
+  
+  // ===== แถวบน - อัตราการไหล =====
+  
+  // 1. Flow Rate 1 (L/min)
+  lb_flow_rate1_title.parent(screen_2);
+  lb_flow_rate1_title = "Flow_LPM1"; 
+  lb_flow_rate1_title.font(prasanmit_35); 
+  lb_flow_rate1_title.color(TFT_WHITE); 
+  lb_flow_rate1_title.position(col1_x_screen2 + 40, row1_y_screen2 + 10); 
+  lb_flow_rate1_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_flow_rate1_display.parent(screen_2);
+  lb_flow_rate1_display = "0.0"; 
+  lb_flow_rate1_display.font(prasanmit_40); 
+  lb_flow_rate1_display.color(TFT_BLACK); 
+  lb_flow_rate1_display.bg_color(TFT_WHITE); 
+  lb_flow_rate1_display.bg_opa(255); 
+  lb_flow_rate1_display.padding(10, 6, 10, 6); 
+  lb_flow_rate1_display.corner_radius(8); 
+  lb_flow_rate1_display.size(150, 50); 
+  lb_flow_rate1_display.position(col1_x_screen2 + 40, row1_y_screen2 + 60); 
+  lb_flow_rate1_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วย - ขยับให้ใกล้ display box มากขึ้น
+  lb_flow_rate1_unit_label.parent(screen_2);
+  lb_flow_rate1_unit_label = "L/min"; 
+  lb_flow_rate1_unit_label.font(prasanmit_25); 
+  lb_flow_rate1_unit_label.color(TFT_WHITE); 
+  lb_flow_rate1_unit_label.position(col1_x_screen2 + 205, row1_y_screen2 + 75); 
+  
+  // 2. Flow Rate 2 (L/min)
+  lb_flow_rate2_title.parent(screen_2);
+  lb_flow_rate2_title = "Flow_LPM2"; 
+  lb_flow_rate2_title.font(prasanmit_35); 
+  lb_flow_rate2_title.color(TFT_WHITE); 
+  lb_flow_rate2_title.position(col2_x_screen2 + 40, row1_y_screen2 + 10); 
+  lb_flow_rate2_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  lb_flow_rate2_display.parent(screen_2);
+  lb_flow_rate2_display = "0.0"; 
+  lb_flow_rate2_display.font(prasanmit_40); 
+  lb_flow_rate2_display.color(TFT_BLACK); 
+  lb_flow_rate2_display.bg_color(TFT_WHITE); 
+  lb_flow_rate2_display.bg_opa(255); 
+  lb_flow_rate2_display.padding(10, 6, 10, 6); 
+  lb_flow_rate2_display.corner_radius(8); 
+  lb_flow_rate2_display.size(150, 50); 
+  lb_flow_rate2_display.position(col2_x_screen2 + 40, row1_y_screen2 + 60); 
+  lb_flow_rate2_display.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_flow_rate2_unit_label.parent(screen_2);
+  lb_flow_rate2_unit_label = "L/min"; 
+  lb_flow_rate2_unit_label.font(prasanmit_25); 
+  lb_flow_rate2_unit_label.color(TFT_WHITE); 
+  lb_flow_rate2_unit_label.position(col2_x_screen2 + 205, row1_y_screen2 + 75); 
+  
+  // 3. Flow Rate 3 (L/min)
+  lb_flow_rate3_title.parent(screen_2);
+  lb_flow_rate3_title = "Flow_LPM3"; 
+  lb_flow_rate3_title.font(prasanmit_35); 
+  lb_flow_rate3_title.color(TFT_WHITE); 
+  lb_flow_rate3_title.position(col3_x_screen2 + 40, row1_y_screen2 + 10); 
+  lb_flow_rate3_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  lb_flow_rate3_display.parent(screen_2);
+  lb_flow_rate3_display = "0.0"; 
+  lb_flow_rate3_display.font(prasanmit_40); 
+  lb_flow_rate3_display.color(TFT_BLACK); 
+  lb_flow_rate3_display.bg_color(TFT_WHITE); 
+  lb_flow_rate3_display.bg_opa(255); 
+  lb_flow_rate3_display.padding(10, 6, 10, 6); 
+  lb_flow_rate3_display.corner_radius(8); 
+  lb_flow_rate3_display.size(150, 50); 
+  lb_flow_rate3_display.position(col3_x_screen2 + 40, row1_y_screen2 + 60); 
+  lb_flow_rate3_display.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_flow_rate3_unit_label.parent(screen_2);
+  lb_flow_rate3_unit_label = "L/min"; 
+  lb_flow_rate3_unit_label.font(prasanmit_25); 
+  lb_flow_rate3_unit_label.color(TFT_WHITE); 
+  lb_flow_rate3_unit_label.position(col3_x_screen2 + 205, row1_y_screen2 + 75); 
+  
+  // ===== แถวล่าง - ปริมาณน้ำรวม =====
+  
+  // 4. Total Liters 1
+  lb_total_liters1_title.parent(screen_2);
+  lb_total_liters1_title = "Flow_Liters1"; 
+  lb_total_liters1_title.font(prasanmit_35); 
+  lb_total_liters1_title.color(TFT_WHITE); 
+  lb_total_liters1_title.position(col1_x_screen2 + 40, row2_y_screen2 + 10); 
+  lb_total_liters1_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  lb_total_liters1_display.parent(screen_2);
+  lb_total_liters1_display = "0.0"; 
+  lb_total_liters1_display.font(prasanmit_40); 
+  lb_total_liters1_display.color(TFT_BLACK); 
+  lb_total_liters1_display.bg_color(TFT_WHITE); 
+  lb_total_liters1_display.bg_opa(255); 
+  lb_total_liters1_display.padding(10, 6, 10, 6); 
+  lb_total_liters1_display.corner_radius(8); 
+  lb_total_liters1_display.size(150, 50); 
+  lb_total_liters1_display.position(col1_x_screen2 + 40, row2_y_screen2 + 60); 
+  lb_total_liters1_display.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_total_liters1_unit_label.parent(screen_2);
+  lb_total_liters1_unit_label = "L"; 
+  lb_total_liters1_unit_label.font(prasanmit_25); 
+  lb_total_liters1_unit_label.color(TFT_WHITE); 
+  lb_total_liters1_unit_label.position(col1_x_screen2 + 205, row2_y_screen2 + 75); 
+  
+  // 5. Total Liters 2
+  lb_total_liters2_title.parent(screen_2);
+  lb_total_liters2_title = "Flow_Liters2"; 
+  lb_total_liters2_title.font(prasanmit_35); 
+  lb_total_liters2_title.color(TFT_WHITE); 
+  lb_total_liters2_title.position(col2_x_screen2 + 40, row2_y_screen2 + 10); 
+  lb_total_liters2_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  lb_total_liters2_display.parent(screen_2);
+  lb_total_liters2_display = "0.0"; 
+  lb_total_liters2_display.font(prasanmit_40); 
+  lb_total_liters2_display.color(TFT_BLACK); 
+  lb_total_liters2_display.bg_color(TFT_WHITE); 
+  lb_total_liters2_display.bg_opa(255); 
+  lb_total_liters2_display.padding(10, 6, 10, 6); 
+  lb_total_liters2_display.corner_radius(8); 
+  lb_total_liters2_display.size(150, 50); 
+  lb_total_liters2_display.position(col2_x_screen2 + 40, row2_y_screen2 + 60); 
+  lb_total_liters2_display.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_total_liters2_unit_label.parent(screen_2);
+  lb_total_liters2_unit_label = "L"; 
+  lb_total_liters2_unit_label.font(prasanmit_25); 
+  lb_total_liters2_unit_label.color(TFT_WHITE); 
+  lb_total_liters2_unit_label.position(col2_x_screen2 + 205, row2_y_screen2 + 75); 
+  
+  // 6. Total Liters 3
+  lb_total_liters3_title.parent(screen_2);
+  lb_total_liters3_title = "Flow_Liters3"; 
+  lb_total_liters3_title.font(prasanmit_35); 
+  lb_total_liters3_title.color(TFT_WHITE); 
+  lb_total_liters3_title.position(col3_x_screen2 + 40, row2_y_screen2 + 10); 
+  lb_total_liters3_title.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_total_liters3_display.parent(screen_2);
+  lb_total_liters3_display = "0.0"; 
+  lb_total_liters3_display.font(prasanmit_40); 
+  lb_total_liters3_display.color(TFT_BLACK); 
+  lb_total_liters3_display.bg_color(TFT_WHITE); 
+  lb_total_liters3_display.bg_opa(255); 
+  lb_total_liters3_display.padding(10, 6, 10, 6); 
+  lb_total_liters3_display.corner_radius(8); 
+  lb_total_liters3_display.size(150, 50); 
+  lb_total_liters3_display.position(col3_x_screen2 + 40, row2_y_screen2 + 60); 
+  lb_total_liters3_display.text_align(TEXT_ALIGN_CENTER);
+  
+  lb_total_liters3_unit_label.parent(screen_2);
+  lb_total_liters3_unit_label = "L"; 
+  lb_total_liters3_unit_label.font(prasanmit_25); 
+  lb_total_liters3_unit_label.color(TFT_WHITE); 
+  lb_total_liters3_unit_label.position(col3_x_screen2 + 205, row2_y_screen2 + 75);
+  
+  // แสดงเวลาอัปเดตล่าสุดที่ด้านล่าง
+  lb_flow_last_update.parent(screen_2);
+  lb_flow_last_update = "อัปเดตล่าสุด: --:--:--";
+  lb_flow_last_update.font(prasanmit_20);
+  lb_flow_last_update.color(TFT_SILVER);
+  lb_flow_last_update.align(ALIGN_BOTTOM, 0, -10);
+  
+  // ปุ่มถัดไป screen_2 -> screen_3
+  btn_next_2 = img_next;
+  btn_next_2.parent(screen_2);
+  btn_next_2.size(60, 48);
+  btn_next_2.corner_radius(0);
+  btn_next_2.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_next_2.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_next_2.align(ALIGN_BOTTOM_RIGHT, -30, -30); // จัดวางที่มุมขวาล่าง
+  btn_next_2.show(true);
+  btn_next_2.onClicked(GWIDGET_CB {
+    screen_2.show(false);
+    screen_3.show(true);
+  });
+
+  // ปุ่มย้อนกลับ screen_2 -> screen_1
+  btn_back_2 = img_back;
+  btn_back_2.parent(screen_2);
+  btn_back_2.size(60, 48);
+  btn_back_2.corner_radius(0);
+  btn_back_2.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_back_2.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_back_2.align(ALIGN_BOTTOM_LEFT, 30, -30); // จัดวางที่มุมซ้ายล่าง
+  btn_back_2.show(true);
+  btn_back_2.onClicked(GWIDGET_CB {
+    screen_2.show(false);
+    screen_1.show(true);
+  });
+
+  // ปุ่มกลับหน้าหลัก screen_2
+  btn_home_2 = img_home;
+  btn_home_2.parent(screen_2);
+  btn_home_2.size(50, 50);    // ลดขนาดลงอีก
+  btn_home_2.corner_radius(0); // ไม่มีมุมโค้ง
+  btn_home_2.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_home_2.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_home_2.align(ALIGN_TOP_RIGHT, -20, 20);
+  btn_home_2.show(true);
+  btn_home_2.onClicked(GWIDGET_CB {
+    screen_2.show(false);
+    background.show(true);
+  });
+
+  // ตั้งค่า screen_3 - ระบบตรวจสอบไฟฟ้า (ใช้ GLabel สีขาวพร้อมข้อความสีดำ)
+  screen_3.size(800, 480);
+  screen_3.color(TFT_BLACK); // พื้นหลังสีดำ
+  screen_3.show(false);
+  
+  // สร้างหัวข้อสำหรับหน้า screen_3
+  GLabel lb_screen3_title(screen_3);
+  lb_screen3_title = "⚡ ระบบตรวจสอบค่าไฟฟ้า ⚡";
+  lb_screen3_title.font(prasanmit_35);
+  lb_screen3_title.color(TFT_WHITE);
+  lb_screen3_title.align(ALIGN_TOP, 0, 15);
+  
+  // เพิ่มเงาสำหรับชื่อหน้าจอ
+  GLabel lb_screen3_title_shadow(screen_3);
+  lb_screen3_title_shadow = lb_screen3_title.text();
+  lb_screen3_title_shadow.font(prasanmit_35);
+  lb_screen3_title_shadow.color(TFT_COLOR_HEX(0x333333));
+  lb_screen3_title_shadow.align(lb_screen3_title, ALIGN_CENTER, 2, 2);
+  lb_screen3_title.toForeground();
+  
+  // กำหนดตำแหน่งแบบ grid 3x2 
+  int box_width = 240;   // ความกว้างกรอบ
+  int box_height = 140;  // ความสูงกรอบ
+  int margin_x_screen3 = 40;
+  int spacing_x_screen3 = (800 - 2 * margin_x_screen3 - 3 * box_width) / 2;
+  
+  int col1_x_screen3 = margin_x_screen3;
+  int col2_x_screen3 = margin_x_screen3 + box_width + spacing_x_screen3;
+  int col3_x_screen3 = margin_x_screen3 + 2 * (box_width + spacing_x_screen3);
+  
+  int row1_y_screen3 = 80;   // แถวบน
+  int row2_y_screen3 = 260;  // แถวล่าง
+  
+  // ===== แถวบน =====
+  
+  // 1. แรงดันไฟฟ้า (Voltage) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_voltage_title.parent(screen_3);
+  lb_voltage_title = "แรงดันไฟฟ้า"; 
+  lb_voltage_title.font(prasanmit_35); 
+  lb_voltage_title.color(TFT_WHITE); 
+  lb_voltage_title.position(col1_x_screen3 + 40, row1_y_screen3 + 10); 
+  lb_voltage_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_voltage_title_shadow(screen_3);
+  lb_voltage_title_shadow = lb_voltage_title.text();
+  lb_voltage_title_shadow.font(prasanmit_35);
+  lb_voltage_title_shadow.color(TFT_BLACK);
+  lb_voltage_title_shadow.position(col1_x_screen3 + 41, row1_y_screen3 + 11); 
+  lb_voltage_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_voltage_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_voltage_display.parent(screen_3);
+  lb_voltage_display = "0.0"; 
+  lb_voltage_display.font(prasanmit_40); 
+  lb_voltage_display.color(TFT_BLACK); 
+  lb_voltage_display.bg_color(TFT_WHITE); 
+  lb_voltage_display.bg_opa(255); 
+  lb_voltage_display.padding(10, 6, 10, 6); 
+  lb_voltage_display.corner_radius(8); 
+  lb_voltage_display.size(160, 55); 
+  lb_voltage_display.position(col1_x_screen3 + 40, row1_y_screen3 + 60); 
+  lb_voltage_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วยแยกนอก GLabel เป็นสีขาว ขนาดใหญ่ขึ้น
+  lb_voltage_unit_label.parent(screen_3);
+  lb_voltage_unit_label = "V"; 
+  lb_voltage_unit_label.font(prasanmit_35); 
+  lb_voltage_unit_label.color(TFT_WHITE); 
+  lb_voltage_unit_label.position(col1_x_screen3 + 210, row1_y_screen3 + 75); 
+  
+  // 2. กระแสไฟฟ้า (Current) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_current_title.parent(screen_3);
+  lb_current_title = "กระแสไฟฟ้า"; 
+  lb_current_title.font(prasanmit_35); 
+  lb_current_title.color(TFT_WHITE); 
+  lb_current_title.position(col2_x_screen3 + 40, row1_y_screen3 + 10); 
+  lb_current_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_current_title_shadow(screen_3);
+  lb_current_title_shadow = lb_current_title.text();
+  lb_current_title_shadow.font(prasanmit_35);
+  lb_current_title_shadow.color(TFT_BLACK);
+  lb_current_title_shadow.position(col2_x_screen3 + 41, row1_y_screen3 + 11); 
+  lb_current_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_current_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_current_display.parent(screen_3);
+  lb_current_display = "0.00"; 
+  lb_current_display.font(prasanmit_40); 
+  lb_current_display.color(TFT_BLACK); 
+  lb_current_display.bg_color(TFT_WHITE); 
+  lb_current_display.bg_opa(255); 
+  lb_current_display.padding(10, 6, 10, 6); 
+  lb_current_display.corner_radius(8); 
+  lb_current_display.size(160, 55); 
+  lb_current_display.position(col2_x_screen3 + 40, row1_y_screen3 + 60); 
+  lb_current_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วยแยกนอก GLabel เป็นสีขาว ขนาดใหญ่ขึ้น
+  lb_current_unit_label.parent(screen_3);
+  lb_current_unit_label = "A"; 
+  lb_current_unit_label.font(prasanmit_35); 
+  lb_current_unit_label.color(TFT_WHITE); 
+  lb_current_unit_label.position(col2_x_screen3 + 210, row1_y_screen3 + 75); 
+  
+  // 3. กำลังไฟฟ้า (Power) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_power_title.parent(screen_3);
+  lb_power_title = "กำลังไฟฟ้า"; 
+  lb_power_title.font(prasanmit_35); 
+  lb_power_title.color(TFT_WHITE); 
+  lb_power_title.position(col3_x_screen3 + 60, row1_y_screen3 + 10); 
+  lb_power_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_power_title_shadow(screen_3);
+  lb_power_title_shadow = lb_power_title.text();
+  lb_power_title_shadow.font(prasanmit_35);
+  lb_power_title_shadow.color(TFT_BLACK);
+  lb_power_title_shadow.position(col3_x_screen3 + 61, row1_y_screen3 + 11); 
+  lb_power_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_power_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_power_display.parent(screen_3);
+  lb_power_display = "0.0"; 
+  lb_power_display.font(prasanmit_40); 
+  lb_power_display.color(TFT_BLACK); 
+  lb_power_display.bg_color(TFT_WHITE); 
+  lb_power_display.bg_opa(255); 
+  lb_power_display.padding(10, 6, 10, 6); 
+  lb_power_display.corner_radius(8); 
+  lb_power_display.size(160, 55); 
+  lb_power_display.position(col3_x_screen3 + 40, row1_y_screen3 + 60); 
+  lb_power_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วยแยกนอก GLabel เป็นสีขาว ขนาดใหญ่ขึ้น
+  lb_power_unit_label.parent(screen_3);
+  lb_power_unit_label = "W"; 
+  lb_power_unit_label.font(prasanmit_35); 
+  lb_power_unit_label.color(TFT_WHITE); 
+  lb_power_unit_label.position(col3_x_screen3 + 210, row1_y_screen3 + 75); 
+  
+  // ===== แถวล่าง =====
+  
+  // 4. พลังงาน (Energy) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_energy_title.parent(screen_3);
+  lb_energy_title = "พลังงาน"; 
+  lb_energy_title.font(prasanmit_35); 
+  lb_energy_title.color(TFT_WHITE); 
+  lb_energy_title.position(col1_x_screen3 + 60, row2_y_screen3 + 10); 
+  lb_energy_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_energy_title_shadow(screen_3);
+  lb_energy_title_shadow = lb_energy_title.text();
+  lb_energy_title_shadow.font(prasanmit_35);
+  lb_energy_title_shadow.color(TFT_BLACK);
+  lb_energy_title_shadow.position(col1_x_screen3 + 61, row2_y_screen3 + 11); 
+  lb_energy_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_energy_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_energy_display.parent(screen_3);
+  lb_energy_display = "0.000"; 
+  lb_energy_display.font(prasanmit_35); 
+  lb_energy_display.color(TFT_BLACK); 
+  lb_energy_display.bg_color(TFT_WHITE); 
+  lb_energy_display.bg_opa(255); 
+  lb_energy_display.padding(10, 6, 10, 6); 
+  lb_energy_display.corner_radius(8); 
+  lb_energy_display.size(160, 55); 
+  lb_energy_display.position(col1_x_screen3 + 40, row2_y_screen3 + 60); 
+  lb_energy_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วยแยกนอก GLabel เป็นสีขาว ขนาดใหญ่ขึ้น
+  lb_energy_unit_label.parent(screen_3);
+  lb_energy_unit_label = "kWh"; 
+  lb_energy_unit_label.font(prasanmit_35); 
+  lb_energy_unit_label.color(TFT_WHITE); 
+  lb_energy_unit_label.position(col1_x_screen3 + 210, row2_y_screen3 + 75); 
+  
+  // 5. ความถี่ (Frequency) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_frequency_title.parent(screen_3);
+  lb_frequency_title = "ความถี่"; 
+  lb_frequency_title.font(prasanmit_35); 
+  lb_frequency_title.color(TFT_WHITE); 
+  lb_frequency_title.position(col2_x_screen3 + 60, row2_y_screen3 + 10); 
+  lb_frequency_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_frequency_title_shadow(screen_3);
+  lb_frequency_title_shadow = lb_frequency_title.text();
+  lb_frequency_title_shadow.font(prasanmit_35);
+  lb_frequency_title_shadow.color(TFT_BLACK);
+  lb_frequency_title_shadow.position(col2_x_screen3 + 61, row2_y_screen3 + 11); 
+  lb_frequency_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_frequency_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_frequency_display.parent(screen_3);
+  lb_frequency_display = "0.0"; 
+  lb_frequency_display.font(prasanmit_40); 
+  lb_frequency_display.color(TFT_BLACK); 
+  lb_frequency_display.bg_color(TFT_WHITE); 
+  lb_frequency_display.bg_opa(255); 
+  lb_frequency_display.padding(10, 6, 10, 6); 
+  lb_frequency_display.corner_radius(8); 
+  lb_frequency_display.size(160, 55); 
+  lb_frequency_display.position(col2_x_screen3 + 40, row2_y_screen3 + 60); 
+  lb_frequency_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // หน่วยแยกนอก GLabel เป็นสีขาว ขนาดใหญ่ขึ้น
+  lb_frequency_unit_label.parent(screen_3);
+  lb_frequency_unit_label = "Hz"; 
+  lb_frequency_unit_label.font(prasanmit_35); 
+  lb_frequency_unit_label.color(TFT_WHITE); 
+  lb_frequency_unit_label.position(col2_x_screen3 + 210, row2_y_screen3 + 75); 
+  
+  // 6. ตัวประกอบกำลัง (Power Factor) - GLabel พื้นหลังสีขาว ข้อความสีดำ
+  lb_powerfactor_title.parent(screen_3);
+  lb_powerfactor_title = "Power Factor"; 
+  lb_powerfactor_title.font(prasanmit_35); 
+  lb_powerfactor_title.color(TFT_WHITE); 
+  lb_powerfactor_title.position(col3_x_screen3 + 40, row2_y_screen3 + 10); 
+  lb_powerfactor_title.text_align(TEXT_ALIGN_CENTER); 
+  
+  // เพิ่มเงาให้ชื่อเพื่อทำให้ดูหนา
+  GLabel lb_powerfactor_title_shadow(screen_3);
+  lb_powerfactor_title_shadow = lb_powerfactor_title.text();
+  lb_powerfactor_title_shadow.font(prasanmit_35);
+  lb_powerfactor_title_shadow.color(TFT_BLACK);
+  lb_powerfactor_title_shadow.position(col3_x_screen3 + 41, row2_y_screen3 + 11); 
+  lb_powerfactor_title_shadow.text_align(TEXT_ALIGN_CENTER);
+  lb_powerfactor_title.toForeground(); 
+  
+  // GLabel พื้นหลังสีขาวสำหรับแสดงค่า
+  lb_powerfactor_display.parent(screen_3);
+  lb_powerfactor_display = "0.00"; 
+  lb_powerfactor_display.font(prasanmit_40); 
+  lb_powerfactor_display.color(TFT_BLACK); 
+  lb_powerfactor_display.bg_color(TFT_WHITE); 
+  lb_powerfactor_display.bg_opa(255); 
+  lb_powerfactor_display.padding(10, 6, 10, 6); 
+  lb_powerfactor_display.corner_radius(8); 
+  lb_powerfactor_display.size(160, 55); 
+  lb_powerfactor_display.position(col3_x_screen3 + 40, row2_y_screen3 + 60); 
+  lb_powerfactor_display.text_align(TEXT_ALIGN_CENTER);
+  
+  // Power Factor ไม่มีหน่วย (ไม่ต้องแสดง unit)
+  lb_powerfactor_unit_label.parent(screen_3);
+  lb_powerfactor_unit_label = ""; 
+  lb_powerfactor_unit_label.font(prasanmit_35);
+  lb_powerfactor_unit_label.color(TFT_WHITE);
+  lb_powerfactor_unit_label.position(col3_x_screen3 + 210, row2_y_screen3 + 75);
+  
+  // แสดงเวลาอัปเดตล่าสุดที่ด้านล่าง
+  lb_electrical_last_update.parent(screen_3);
+  lb_electrical_last_update = "อัปเดตล่าสุด: --:--:--";
+  lb_electrical_last_update.font(prasanmit_20);
+  lb_electrical_last_update.color(TFT_SILVER);
+  lb_electrical_last_update.align(ALIGN_BOTTOM, 0, -10);
+  
+  // เส้นแบ่งสวยงาม
+  GLine line_bottom(screen_3);
+  point_precise_t line_points_screen3[] = {{60, 400}, {740, 400}};
+  line_bottom.points(line_points_screen3, 2);
+  line_bottom.color(TFT_DARKGRAY);
+  line_bottom.thickness(1);
+
+  // ปุ่มย้อนกลับ screen_3 -> screen_2
+  btn_back_3 = img_back;
+  btn_back_3.parent(screen_3);
+  btn_back_3.size(60, 48);
+  btn_back_3.corner_radius(0);
+  btn_back_3.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_back_3.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_back_3.align(ALIGN_BOTTOM_LEFT, 30, -30); // จัดวางที่มุมซ้ายล่าง
+  btn_back_3.show(true);
+  btn_back_3.onClicked(GWIDGET_CB {
+    screen_3.show(false);
+    screen_2.show(true);
+  });
+
+  // ปุ่มกลับหน้าหลัก screen_3
+  btn_home_3 = img_home;
+  btn_home_3.parent(screen_3);
+  btn_home_3.size(50, 50);    // ลดขนาดลงอีก
+  btn_home_3.corner_radius(0); // ไม่มีมุมโค้ง
+  btn_home_3.bg_opa(0);       // ทำให้พื้นหลังโปร่งใส
+  btn_home_3.padding(0);      // ไม่มีขอบเพิ่มเติม
+  btn_home_3.align(ALIGN_TOP_RIGHT, -20, 20);
+  btn_home_3.show(true);
+  btn_home_3.onClicked(GWIDGET_CB {
+    screen_3.show(false);
+    background.show(true);
+  });
+
+  // เพิ่มปุ่มแสดงหน้า Dashboard ในหน้าหลัก
+  GButton btn_view_dashboard;
+  btn_view_dashboard = "ดูแดชบอร์ด";
+  btn_view_dashboard.parent(background);
+  btn_view_dashboard.size(300, 60);
+  btn_view_dashboard.corner_radius(15);
+  btn_view_dashboard.color(TFT_PALETTE_GREEN);
+  btn_view_dashboard.font(prasanmit_30);
+  btn_view_dashboard.font_color(TFT_WHITE);
+  btn_view_dashboard.shadow(2);
+  btn_view_dashboard.padding(10);
+  btn_view_dashboard.align(btn_view_sensor, ALIGN_BOTTOM, 0, 20);
+  btn_view_dashboard.show(true);
+  btn_view_dashboard.onClicked(GWIDGET_CB {
+    screen_dashboard.show(true);
+    background.show(false);
+  });
+  
+  // สร้างหน้า Dashboard
+  setupDashboard();
+  
+  // ตั้งค่าให้อัพเดทเวลาทุก 1 วินาที
+  static SoftTimer timer_update_dashboard;
+  timer_update_dashboard.setInterval(1000, [](){
+    // อัพเดทเวลาและวันที่
+    lb_clock_dashboard = StringX::printf("%02d:%02d:%02d", hour(), minute(), second());
+    lb_date_dashboard = StringX::printf("%02d/%02d/%04d", day(), month(), year());
+  });
+
+  line_bottom.thickness(2);
+
+  // ปุ่มกลับหน้าหลัก
+  btn_home_3 = img_home;
+  btn_home_3.parent(screen_3);
+  btn_home_3.size(50, 50);
+  btn_home_3.corner_radius(0);
+  btn_home_3.bg_opa(0);
+  btn_home_3.padding(0);
+  btn_home_3.align(ALIGN_TOP_RIGHT, -20, 20);
+  btn_home_3.show(true);
+  btn_home_3.onClicked(GWIDGET_CB {
+    screen_3.show(false);
+    background.show(true);
+  });
+  
+  // อัปเดตค่าเริ่มต้น
+  updateElectricalDisplay();
+  
+  // ตั้งค่าอัปเดตเวลาทุก 1 วินาที
+  static SoftTimer timer;
+  timer.setInterval(1000, [](){
+    updateElectricalDisplay();
+  });
+
+  // อัปเดตค่าเริ่มต้นสำหรับ screen_2
+  updateFlowDisplay();
+  
+  // ตั้งค่าอัปเดตเวลาทุก 1 วินาทีสำหรับ screen_2
+  static SoftTimer timer_flow;
+  timer_flow.setInterval(1000, [](){
+    updateFlowDisplay();
+  });
+
+  // สร้างวงกลมแสดงสถานะน้ำ
+  water_level_circle.parent(screen_1);
+  water_level_circle.size(120, 120); // เพิ่มขนาดจาก 100 เป็น 120
+  water_level_circle.position(600, 260); // ปรับตำแหน่ง X จาก 530 เป็น 600
+  water_level_circle.color(TFT_RED); // กำหนดเป็นสีแดงคงที่
+  water_level_circle.bg_color(TFT_COLOR_HEX(0x181820));
+  water_level_circle.bg_opa(255);
+
+  // สร้าง GLabel แสดงสถานะน้ำ
+  lb_water_level_status.parent(screen_1);
+  lb_water_level_status = "น้ำหมด"; // กำหนดข้อความคงที่
+  lb_water_level_status.font(prasanmit_30);
+  lb_water_level_status.color(TFT_WHITE);
+  lb_water_level_status.align(water_level_circle, ALIGN_CENTER, 0, 0); // จัดตำแหน่งให้อยู่กลางวงกลม
+}
+
+void loop() {
+  BlynkGO.update();
+}
+
+NTP_SYNCED() {
+  static SoftTimer timer;
+  timer.setInterval(1000, []() {
+    lb_clock = StringX::printf("%02d:%02d:%02d", hour(), minute(), second());
+  });
+}
+
+// ฟังก์ชัน setupDashboard() สำหรับสร้างหน้า Dashboard
+void setupDashboard() {
+  // ตั้งค่าหน้า Dashboard
+  screen_dashboard.size(800, 480);
+  screen_dashboard.color(TFT_COLOR_HEX(0x111B30)); // สีน้ำเงินเข้ม
+  screen_dashboard.show(false);
+  
+  // สร้างหัวข้อสำหรับหน้า Dashboard
+  lb_dashboard_title = "ระบบควบคุมการปลูกพืช Smart Farm";
+  lb_dashboard_title.parent(screen_dashboard);
+  lb_dashboard_title.font(prasanmit_40);
+  lb_dashboard_title.color(TFT_WHITE);
+  lb_dashboard_title.align(ALIGN_TOP, 0, 10);
+  
+  // เพิ่มเงาสำหรับชื่อหน้าจอเพื่อให้อ่านชัดเจนยิ่งขึ้น
+  GLabel lb_dashboard_title_shadow(screen_dashboard);
+  lb_dashboard_title_shadow = lb_dashboard_title.text();
+  lb_dashboard_title_shadow.font(prasanmit_40);
+  lb_dashboard_title_shadow.color(TFT_BLACK);
+  lb_dashboard_title_shadow.align(lb_dashboard_title, ALIGN_CENTER, 1, 1);
+  lb_dashboard_title.toForeground();
+  
+  // เพิ่มนาฬิกาและวันที่
+  lb_clock_dashboard.parent(screen_dashboard);
+  lb_clock_dashboard.font(prasanmit_30);
+  lb_clock_dashboard.color(TFT_WHITE);
+  lb_clock_dashboard.align(ALIGN_TOP_LEFT, 20, 70);
+  
+  lb_date_dashboard.parent(screen_dashboard);
+  lb_date_dashboard.font(prasanmit_25);
+  lb_date_dashboard.color(TFT_SILVER);
+  lb_date_dashboard.align(lb_clock_dashboard, ALIGN_BOTTOM, 0, 5);
+  
+  // ตั้งค่าเกจวัดแถวบน
+  String row1_titles[] = {"อุณหภูมิ (°C)", "ความชื้น (%)", "คาร์บอนฯ (ppm)", "ค่า pH"};
+  color_t row1_colors[][4] = {
+    {TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED},
+    {TFT_RED, TFT_YELLOW, TFT_GREEN, TFT_BLUE},
+    {TFT_GREEN, TFT_BLUE, TFT_YELLOW, TFT_RED},
+    {TFT_RED, TFT_YELLOW, TFT_GREEN, TFT_RED}
+  };
+  float row1_ranges[][5] = {
+    {0, 15, 25, 35, 50},   // อุณหภูมิ
+    {0, 30, 50, 70, 100},  // ความชื้น
+    {0, 400, 700, 1000, 1500}, // คาร์บอนฯ
+    {0, 5, 7, 9, 14}       // pH
+  };
+  int row1_decimals[] = {1, 0, 0, 1};
+  
+  // แถวแรก - 4 เกจ
+  for(int i=0; i<4; i++) {
+    gauge_row1[i].parent(screen_dashboard);
+    gauge_row1[i].size(140, 140);  // เพิ่มขนาดเกจให้ใหญ่ขึ้น
+    gauge_row1[i].position(75 + i*170, 130);  // ปรับตำแหน่งและระยะห่างระหว่างเกจ
+    gauge_row1[i].setRanges(row1_ranges[i][0], row1_ranges[i][1], row1_ranges[i][2], row1_ranges[i][3], row1_ranges[i][4]);
+    gauge_row1[i].setColors(row1_colors[i][0], row1_colors[i][1], row1_colors[i][2], row1_colors[i][3]);
+    gauge_row1[i].setTitle(row1_titles[i].c_str());
+    gauge_row1[i].setDecimal(row1_decimals[i]);
+    
+    // ใช้ค่าจริงจากเซ็นเซอร์แทนค่าสุ่ม
+    switch(i) {
+      case 0: gauge_row1[i] = air_temp_value; break;    // อุณหภูมิ
+      case 1: gauge_row1[i] = humidity_value; break;    // ความชื้น
+      case 2: gauge_row1[i] = co2_value; break;         // คาร์บอนไดออกไซด์
+      case 3: gauge_row1[i] = water_ph_value; break;    // pH
+    }
+    
+    // ปรับแต่งชื่อและหน่วยให้ชัดเจน
+    gauge_row1[i].lb_title.font(prasanmit_25);  // เพิ่มขนาดฟอนต์
+    gauge_row1[i].lb_title.color(TFT_CYAN);
+    gauge_row1[i].lb_title.align(gauge_row1[i], ALIGN_TOP, 0, -35);  // เพิ่มระยะห่างจากเกจ
+    
+    gauge_row1[i].lb_unit.font(prasanmit_25);  // เพิ่มขนาดฟอนต์
+    gauge_row1[i].lb_unit.color(TFT_WHITE);
+    gauge_row1[i].lb_unit.align(gauge_row1[i], ALIGN_BOTTOM, 0, 35);  // เพิ่มระยะห่างจากเกจ
+    
+    // ตรวจสอบว่ามีการแสดงหน่วยหรือไม่
+    if (gauge_row1[i].lb_unit.text() == "") {
+      // กำหนดหน่วยโดยตรง
+      switch(i) {
+        case 0: gauge_row1[i].lb_unit = "°C"; break;
+        case 1: gauge_row1[i].lb_unit = "%"; break;
+        case 2: gauge_row1[i].lb_unit = "ppm"; break;
+        case 3: gauge_row1[i].lb_unit = "pH"; break;
+      }
+    }
+    
+    // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+    GLabel lb_title_shadow(screen_dashboard);
+    lb_title_shadow = gauge_row1[i].lb_title.text();
+    lb_title_shadow.font(prasanmit_25);
+    lb_title_shadow.color(TFT_BLACK);
+    lb_title_shadow.align(gauge_row1[i].lb_title, ALIGN_CENTER, 1, 1);
+    gauge_row1[i].lb_title.toForeground();
+  }
+  
+  // ตั้งค่าเกจวัดแถวล่าง
+  String row2_titles[] = {"แสงสว่าง (lux)", "ความชื้นดิน (%)", "EC (mS/cm)", "อุณหภูมิน้ำ (°C)"};
+  color_t row2_colors[][4] = {
+    {TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED},
+    {TFT_RED, TFT_YELLOW, TFT_GREEN, TFT_BLUE},
+    {TFT_GREEN, TFT_BLUE, TFT_YELLOW, TFT_RED},
+    {TFT_BLUE, TFT_GREEN, TFT_YELLOW, TFT_RED}
+  };
+  float row2_ranges[][5] = {
+    {0, 200, 500, 800, 1000},  // แสงสว่าง
+    {0, 30, 50, 70, 100},      // ความชื้นดิน
+    {0, 1, 2, 3, 4},           // EC
+    {0, 15, 25, 35, 50}        // อุณหภูมิน้ำ
+  };
+  int row2_decimals[] = {0, 0, 2, 1};
+  
+  // แถวสอง - 4 เกจ
+  for(int i=0; i<4; i++) {
+    gauge_row2[i].parent(screen_dashboard);
+    gauge_row2[i].size(140, 140);  // เพิ่มขนาดเกจให้ใหญ่ขึ้น
+    gauge_row2[i].position(75 + i*170, 310);  // ปรับตำแหน่งและระยะห่างระหว่างเกจ
+    gauge_row2[i].setRanges(row2_ranges[i][0], row2_ranges[i][1], row2_ranges[i][2], row2_ranges[i][3], row2_ranges[i][4]);
+    gauge_row2[i].setColors(row2_colors[i][0], row2_colors[i][1], row2_colors[i][2], row2_colors[i][3]);
+    gauge_row2[i].setTitle(row2_titles[i].c_str());
+    gauge_row2[i].setDecimal(row2_decimals[i]);
+    
+    // ใช้ค่าจริงจากเซ็นเซอร์แทนค่าสุ่ม
+    switch(i) {
+      case 0: gauge_row2[i] = light_value; break;       // แสงสว่าง
+      case 1: gauge_row2[i] = water_level_value; break; // ระดับน้ำ (ใช้แทนความชื้นดิน)
+      case 2: gauge_row2[i] = ec_value; break;          // EC
+      case 3: gauge_row2[i] = water_temp_value; break;  // อุณหภูมิน้ำ
+    }
+    
+    // ปรับแต่งชื่อและหน่วยให้ชัดเจน
+    gauge_row2[i].lb_title.font(prasanmit_25);  // เพิ่มขนาดฟอนต์
+    gauge_row2[i].lb_title.color(TFT_CYAN);
+    gauge_row2[i].lb_title.align(gauge_row2[i], ALIGN_TOP, 0, -35);  // เพิ่มระยะห่างจากเกจ
+    
+    gauge_row2[i].lb_unit.font(prasanmit_25);  // เพิ่มขนาดฟอนต์
+    gauge_row2[i].lb_unit.color(TFT_WHITE);
+    gauge_row2[i].lb_unit.align(gauge_row2[i], ALIGN_BOTTOM, 0, 35);  // เพิ่มระยะห่างจากเกจ
+    
+    // ตรวจสอบว่ามีการแสดงหน่วยหรือไม่
+    if (gauge_row2[i].lb_unit.text() == "") {
+      // กำหนดหน่วยโดยตรง
+      switch(i) {
+        case 0: gauge_row2[i].lb_unit = "lux"; break;
+        case 1: gauge_row2[i].lb_unit = "%"; break;
+        case 2: gauge_row2[i].lb_unit = "mS/cm"; break;
+        case 3: gauge_row2[i].lb_unit = "°C"; break;
+      }
+    }
+    
+    // เพิ่มเงาให้ชื่อเกจเพื่อการอ่านที่ชัดเจนยิ่งขึ้น
+    GLabel lb_title_shadow(screen_dashboard);
+    lb_title_shadow = gauge_row2[i].lb_title.text();
+    lb_title_shadow.font(prasanmit_25);
+    lb_title_shadow.color(TFT_BLACK);
+    lb_title_shadow.align(gauge_row2[i].lb_title, ALIGN_CENTER, 1, 1);
+    gauge_row2[i].lb_title.toForeground();
+  }
+  
+  // สร้างกราฟวงกลมแสดงสัดส่วน - ใช้ CHART_TYPE_LINE แทน เนื่องจากไม่มี CHART_TYPE_PIE
+  pie_chart.parent(screen_dashboard);
+  pie_chart.size(180, 180);
+  pie_chart.position(650, 190);
+  pie_chart.type(CHART_TYPE_LINE);
+  pie_chart.font(prasanmit_20);
+  pie_chart.color(TFT_WHITE);
+  pie_chart.add_series(TFT_RED);
+  pie_chart.add_series(TFT_GREEN);
+  pie_chart.add_series(TFT_BLUE);
+  pie_chart.add_series(TFT_YELLOW);
+  pie_chart.add_series(TFT_CYAN);
+  
+  // เพิ่มข้อมูลเริ่มต้นด้วยวิธีอื่น - ข้ามการเพิ่มข้อมูลเนื่องจากไม่มีเมธอด points
+  // สำหรับการใช้งานจริงควรศึกษาเมธอดที่ถูกต้องของ GChart
+
+  // สร้าง Slider ควบคุม
+  slider_control.parent(screen_dashboard);
+  slider_control.size(300, 20);
+  slider_control.position(400, 390);
+  slider_control.range(0, 100);
+  slider_control.value(50);
+  slider_control.color(TFT_BLUE);
+  
+  // สร้างกลุ่มปุ่มควบคุม
+  container_buttons.parent(screen_dashboard);
+  container_buttons.layout(LAYOUT_ROW_M);
+  container_buttons.size(650, 60);
+  container_buttons.position(300, 430);
+  container_buttons.color(TFT_COLOR_HEX(0x111B30));
+  
+  // ปุ่มปั๊มน้ำ 1
+  btn_pump1.parent(container_buttons);
+  btn_pump1 = "ปั๊มน้ำ";
+  btn_pump1.size(150, 50);
+  btn_pump1.corner_radius(10);
+  btn_pump1.color(TFT_BLUE);
+  btn_pump1.font(prasanmit_25);
+  btn_pump1.font_color(TFT_WHITE);
+  
+  // ปุ่มปั๊มน้ำ 2
+  btn_pump2.parent(container_buttons);
+  btn_pump2 = "พ่นหมอก";
+  btn_pump2.size(150, 50);
+  btn_pump2.corner_radius(10);
+  btn_pump2.color(TFT_CYAN);
+  btn_pump2.font(prasanmit_25);
+  btn_pump2.font_color(TFT_WHITE);
+  
+  // ปุ่มไฟ
+  btn_light.parent(container_buttons);
+  btn_light = "แสงไฟ";
+  btn_light.size(150, 50);
+  btn_light.corner_radius(10);
+  btn_light.color(TFT_YELLOW);
+  btn_light.font(prasanmit_25);
+  btn_light.font_color(TFT_WHITE);
+  
+  // ปุ่มพัดลม
+  btn_fan.parent(container_buttons);
+  btn_fan = "พัดลม";
+  btn_fan.size(150, 50);
+  btn_fan.corner_radius(10);
+  btn_fan.color(TFT_GREEN);
+  btn_fan.font(prasanmit_25);
+  btn_fan.font_color(TFT_WHITE);
+  
+  // เพิ่มฟังก์ชันการทำงานให้ปุ่ม - ใช้ color เพื่อแสดงสถานะแทน
+  btn_pump1.onClicked([](GWidget*w){
+    static bool pump1_on = false;
+    pump1_on = !pump1_on;
+    if(pump1_on) {
+      btn_pump1.color(TFT_NAVY); // ใช้สีเข้มที่มีอยู่
+    } else {
+      btn_pump1.color(TFT_BLUE);
+    }
+  });
+  
+  btn_pump2.onClicked([](GWidget*w){
+    static bool pump2_on = false;
+    pump2_on = !pump2_on;
+    if(pump2_on) {
+      btn_pump2.color(TFT_NAVY); // ใช้สีเข้มที่มีอยู่
+    } else {
+      btn_pump2.color(TFT_CYAN);
+    }
+  });
+  
+  btn_light.onClicked([](GWidget*w){
+    static bool light_on = false;
+    light_on = !light_on;
+    if(light_on) {
+      btn_light.color(TFT_ORANGE); // ใช้สีเข้มที่มีอยู่
+    } else {
+      btn_light.color(TFT_YELLOW);
+    }
+  });
+  
+  btn_fan.onClicked([](GWidget*w){
+    static bool fan_on = false;
+    fan_on = !fan_on;
+    if(fan_on) {
+      btn_fan.color(TFT_DARKGREEN); // ใช้สีเข้มที่มีอยู่
+    } else {
+      btn_fan.color(TFT_GREEN);
+    }
+  });
+  
+  // เพิ่มปุ่มกลับหน้าหลัก - แก้ไขการสร้าง GImageButton
+  GImageButton btn_home_dashboard(img_home, screen_dashboard);
+  btn_home_dashboard.size(50, 50);
+  btn_home_dashboard.corner_radius(0);
+  btn_home_dashboard.bg_opa(0);
+  btn_home_dashboard.padding(0);
+  btn_home_dashboard.align(ALIGN_TOP_RIGHT, -20, 20);
+  btn_home_dashboard.show(true);
+  btn_home_dashboard.onClicked(GWIDGET_CB {
+    screen_dashboard.show(false);
+    background.show(true);
+  });
+
+  // สร้างวงกลมแสดงสถานะน้ำ
+  water_level_circle.parent(screen_1);
+  water_level_circle.size(120, 120); // เพิ่มขนาดจาก 100 เป็น 120
+  water_level_circle.position(600, 260); // ปรับตำแหน่ง X จาก 530 เป็น 600
+  water_level_circle.color(TFT_RED); // กำหนดเป็นสีแดงคงที่
+  water_level_circle.bg_color(TFT_COLOR_HEX(0x181820));
+  water_level_circle.bg_opa(255);
+}
+
+// ฟังก์ชันอัปเดตการแสดงผลของเกจวัดทั้งหมด
+void updateAllGauges() {
+  gauge_co2.value(co2_value);
+  gauge_air_temp.value(air_temp_value);
+  gauge_humidity.value(humidity_value);
+  gauge_light.value(light_value);
+  gauge_ec.value(ec_value);
+  gauge_water_ph.value(water_ph_value);
+  gauge_water_temp.value(water_temp_value);
+}
+
+void updateElectricalDisplay() {
+  // อัปเดตการแสดงผลค่าไฟฟ้าจากตัวแปรที่ได้รับจาก MQTT
+  lb_voltage_display = String(voltage_value, 1);
+  lb_current_display = String(current_value, 2);
+  lb_power_display = String(power_value, 1);
+  lb_energy_display = String(energy_value, 3);
+  lb_frequency_display = String(frequency_value, 1);
+  lb_powerfactor_display = String(pf_value, 2);
+  
+  // อัปเดตเวลาล่าสุด
+  lb_electrical_last_update = "อัปเดตล่าสุด: " + StringX::printf("%02d:%02d:%02d", hour(), minute(), second());
+}
+
+void updateFlowDisplay() {
+  // อัปเดตการแสดงผลค่า Flow จากตัวแปรที่ได้รับจาก MQTT
+  lb_flow_rate1_display = String(flow_rate1_value, 1);
+  lb_flow_rate2_display = String(flow_rate2_value, 1);
+  lb_flow_rate3_display = String(flow_rate3_value, 1);
+  lb_total_liters1_display = String(total_liters1_value, 1);
+  lb_total_liters2_display = String(total_liters2_value, 1);
+  lb_total_liters3_display = String(total_liters3_value, 1);
+  
+  // อัปเดตเวลาล่าสุด
+  lb_flow_last_update = "อัปเดตล่าสุด: " + StringX::printf("%02d:%02d:%02d", hour(), minute(), second());
+}
