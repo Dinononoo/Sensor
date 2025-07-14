@@ -1,0 +1,138 @@
+#include <ModbusMaster.h>
+
+#define MAX485_DE      2
+#define MAX485_RE_NEG  3
+
+ModbusMaster node;
+
+#define SLAVE_ID 1
+#define SENSOR_RANGE 4400
+bool isSensorRange4400 = true;
+
+void preTransmission() {
+  digitalWrite(MAX485_RE_NEG, HIGH);
+  digitalWrite(MAX485_DE, HIGH);
+}
+
+void postTransmission() {
+  digitalWrite(MAX485_RE_NEG, LOW);
+  digitalWrite(MAX485_DE, LOW);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(MAX485_DE, OUTPUT);
+  pinMode(MAX485_RE_NEG, OUTPUT);
+  digitalWrite(MAX485_RE_NEG, LOW);
+  digitalWrite(MAX485_DE, LOW);
+
+  Serial1.begin(9600);
+
+  node.begin(SLAVE_ID, Serial1);
+  node.preTransmission(preTransmission);
+  node.postTransmission(postTransmission);
+
+  Serial.println("เริ่มการสื่อสาร Modbus กับ EC Transmitter");
+  Serial.println("--------------------------------------");
+  Serial.println("ช่วงของเซ็นเซอร์: " + String(isSensorRange4400 ? "0~4400 uS/cm" : "0~44000 uS/cm"));
+  Serial.println("--------------------------------------");
+  
+  delay(2000);
+}
+
+void loop() {
+  uint8_t result;
+  Serial.println("\nกำลังอ่านค่าจาก EC Transmitter...");
+
+  result = node.readHoldingRegisters(0x00, 2);
+
+  if (result == node.ku8MBSuccess) {
+    uint16_t ec_calibration = node.getResponseBuffer(0);
+    uint16_t ec_value = node.getResponseBuffer(1);
+
+    Serial.println("ค่าดิบที่อ่านได้:");
+    Serial.print("EC Calibration (HEX): 0x");
+    Serial.print(ec_calibration, HEX);
+    Serial.print(" (DEC: ");
+    Serial.print(ec_calibration);
+    Serial.println(")");
+
+    Serial.print("EC Value (HEX): 0x");
+    Serial.print(ec_value, HEX);
+    Serial.print(" (DEC: ");
+    Serial.print(ec_value);
+    Serial.println(")");
+
+    Serial.println("\nค่าที่แปลงแล้ว:");
+    if (isSensorRange4400) {
+      Serial.print("ค่า EC สอบเทียบ: ");
+      Serial.print(ec_calibration / 10.0, 1);
+      Serial.println(" uS/cm");
+      
+      Serial.print("ค่า EC ปัจจุบัน: ");
+      Serial.print(ec_value / 10.0, 1);
+      Serial.println(" uS/cm");
+    } else {
+      Serial.print("ค่า EC สอบเทียบ: ");
+      Serial.print(ec_calibration);
+      Serial.println(" uS/cm");
+      
+      Serial.print("ค่า EC ปัจจุบัน: ");
+      Serial.print(ec_value);
+      Serial.println(" uS/cm");
+    }
+  } else {
+    Serial.print("เกิดข้อผิดพลาด: ");
+    Serial.print(result, DEC);
+    Serial.print(" (0x");
+    Serial.print(result, HEX);
+    Serial.println(")");
+
+    switch(result) {
+      case node.ku8MBIllegalFunction:
+        Serial.println("รหัสฟังก์ชันไม่ถูกต้อง");
+        break;
+      case node.ku8MBIllegalDataAddress:
+        Serial.println("ที่อยู่ข้อมูลไม่ถูกต้อง");
+        break;
+      case node.ku8MBIllegalDataValue:
+        Serial.println("ค่าข้อมูลไม่ถูกต้อง");
+        break;
+      case node.ku8MBSlaveDeviceFailure:
+        Serial.println("อุปกรณ์ slave ทำงานผิดพลาด");
+        break;
+      case node.ku8MBInvalidSlaveID:
+        Serial.println("Slave ID ไม่ถูกต้อง");
+        break;
+      case node.ku8MBInvalidFunction:
+        Serial.println("ฟังก์ชันไม่ถูกต้อง");
+        break;
+      case node.ku8MBResponseTimedOut:
+        Serial.println("หมดเวลาการตอบสนอง - ตรวจสอบการเชื่อมต่อและการตั้งค่า");
+        Serial.println("1. ตรวจสอบการเชื่อมต่อสายไฟ A และ B");
+        Serial.println("2. ตรวจสอบแหล่งจ่ายไฟ (12-24V)");
+        Serial.println("3. ตรวจสอบ Slave ID");
+        Serial.println("4. ตรวจสอบการตั้งค่าบอดเรต");
+        break;
+      case node.ku8MBInvalidCRC:
+        Serial.println("CRC ไม่ถูกต้อง");
+        break;
+      default:
+        Serial.println("ข้อผิดพลาดที่ไม่ทราบสาเหตุ");
+        break;
+    }
+
+    Serial.println("\nกำลังตรวจสอบที่อยู่อุปกรณ์...");
+    uint8_t addr_result = node.readHoldingRegisters(0x02, 1);
+    if (addr_result == node.ku8MBSuccess) {
+      uint16_t device_addr = node.getResponseBuffer(0);
+      Serial.print("ที่อยู่อุปกรณ์: ");
+      Serial.println(device_addr);
+    } else {
+      Serial.println("ไม่สามารถอ่านที่อยู่อุปกรณ์ได้");
+    }
+  }
+
+  delay(2000);
+}
