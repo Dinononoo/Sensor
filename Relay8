@@ -1,0 +1,1824 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <BeeNeXT.h>
+
+// ข้อมูล WiFi และ MQTT
+const char* ssid = "nubia";      
+const char* password = "123456789";    
+const char* mqtt_server = "3.25.216.166";
+const int mqtt_port = 1883;
+const char* mqtt_username = "wasuMQTT";
+const char* mqtt_password = "123456789Za";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+const char* cabinetId = "cab_tok_001";
+char topic_control[50];
+DynamicJsonDocument doc(8192);  // เพิ่มขนาดเป็น 8192 เผื่อมีข้อมูลมาก
+
+// กำหนดขา GPIO สำหรับ ESP32-S3-DevKitC-1
+// ปรับให้ตรงกับการเชื่อมต่อจริงตามที่ระบุ
+// *** หมายเหตุ: ESP32-S3 ไม่ได้ควบคุม relay โดยตรง แต่ส่งคำสั่งผ่าน UART ไปยัง Mega ***
+// GPIO pins เหล่านี้สำหรับการควบคุมอุปกรณ์อื่นๆ (ถ้ามี) หรือสำหรับอนาคต
+int ecPumpPin = 4;         // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int phPumpPin = 5;         // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int agitatorPumpPin = 6;   // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int fan_internal_pin = 7;  // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int fan_external_pin = 8;  // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int light_pin = 14;        // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int co2_pin = 19;          // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+int cooling_pump_pin = 21; // สำรอง (ไม่ใช้ในระบบปัจจุบัน)
+
+// ขา Serial2 สำหรับเชื่อมต่อกับ Arduino Mega (ตามที่ระบุ)
+// ESP32-S3 GPIO17 (TX2) -> Arduino Mega RX2 (ขา 17)
+// ESP32-S3 GPIO18 (RX2) -> Arduino Mega TX2 (ขา 16)
+#define RXD2 18  // GPIO18 บน ESP32-S3 รับข้อมูลจาก Arduino Mega TX2 (ขา 16)
+#define TXD2 17  // GPIO17 บน ESP32-S3 ส่งข้อมูลไป Arduino Mega RX2 (ขา 17)
+
+// ตัวแปรสำหรับการจัดการเวลาแบบ non-blocking
+unsigned long currentMillis;  // เก็บเวลาในขณะนี้
+unsigned long mqttReconnectInterval = 2000;  // เวลาที่จะหน่วงการลองเชื่อมต่อใหม่ (ในมิลลิวินาที)
+
+// ตัวแปรสำหรับปั๊มกวนสาร
+unsigned long agitatorPumpStartTime = 0;  // เวลาที่เริ่มทำงานของปั๊มกวนสาร
+unsigned long agitatorPumpDelay = 3600000;  // ระยะเวลาที่ปั๊มจะทำงาน (1 ชั่วโมง เป็นค่าเริ่มต้น)
+bool agitatorPumpRunning = false;  // สถานะการทำงานของปั๊มกวนสาร
+
+// ตัวแปรสำหรับปั๊ม EC
+unsigned long ecPumpStartTime = 0;  // เวลาเริ่มทำงานของปั๊ม EC
+unsigned long ecPumpDuration = 0;   // ระยะเวลาที่ปั๊ม EC จะทำงาน (คำนวณจากค่าผิดพลาด * kofec)
+bool ecPumpRunning = false;         // สถานะการทำงานของปั๊ม EC
+
+// ตัวแปรสำหรับปั๊ม PH
+unsigned long phPumpStartTime = 0;  // เวลาเริ่มทำงานของปั๊ม PH
+unsigned long phPumpDuration = 0;   // ระยะเวลาที่ปั๊ม PH จะทำงาน (คำนวณจากค่าผิดพลาด * kofph)
+bool phPumpRunning = false;         // สถานะการทำงานของปั๊ม PH
+
+bool receivedData = false; // ตรวจสอบว่าได้รับข้อมูลจาก MQTT แล้วหรือยัง
+
+// เพิ่มตัวแปรสำหรับเก็บค่า timestamp
+unsigned long unixTimestamp = 0;
+unsigned long timeOnly = 0;
+
+// ตัวแปรสำหรับเก็บค่าเซ็นเซอร์ (จากบอร์ด Arduino Mega)
+int co2Value = 0;
+float airHumidity = 0.0;
+float airTemperature = 0.0;
+float waterPH = 0.0;
+float ecValue = 0.0;
+float waterTemperature = 0.0;
+unsigned long lightValue = 0;
+int waterLevel = 0;
+
+// ตัวแปรสำหรับเก็บค่าจาก PZEM-004T
+float voltage = 0.0;
+float current = 0.0;
+float power = 0.0;
+float energy = 0.0;
+float frequency = 0.0;
+float pf = 0.0;
+
+bool hasNewSensorData = false;  // ตัวแปรสำหรับติดตามว่ามีข้อมูลใหม่จาก Arduino Mega หรือไม่
+
+//ตัวแปรอัตราการไหลของน้ำ
+float flowRate1 = 0.0, flowRate2 = 0.0, flowRate3 = 0.0;
+float totalLiters1 = 0.0, totalLiters2 = 0.0, totalLiters3 = 0.0;
+
+// เพิ่มตัวแปรสำหรับตรวจสอบการสื่อสารกับ Mega
+unsigned long lastMegaComm = 0;
+bool megaConnected = false;
+
+// ตัวแปรสำหรับกำหนดเวลาในการรับข้อมูลจาก Arduino Mega
+unsigned long lastMegaDataCheckTime = 0;
+const unsigned long megaDataCheckInterval = 10; // ตรวจสอบข้อมูลทุก 10ms (เร็วมาก)
+
+// ตัวแปรสำหรับกำหนดเวลาในการส่งข้อมูล MQTT
+unsigned long lastSensorPublishTime = 0;
+const unsigned long sensorPublishInterval = 200; // ส่งข้อมูลทุก 200ms (5 ครั้งต่อวินาที)
+
+// ตัวแปรสำหรับการล็อกและแสดงผลสถานะ
+bool debugEnabled = true;  // เปิด/ปิดการแสดงข้อความดีบัก
+unsigned long lastStatusPrint = 0;
+const unsigned long statusPrintInterval = 30000;  // แสดงสถานะทุก 30 วินาที
+
+// เพิ่มตัวแปรสำหรับการร้องขอข้อมูล
+unsigned long lastDataRequestTime = 0;
+const unsigned long dataRequestInterval = 500;  // ร้องขอข้อมูลทุก 500ms (เร็วขึ้น)
+
+// ตัวแปรสำหรับ BeeNeXT display update
+unsigned long lastBeeNeXTUpdateTime = 0;
+const unsigned long beeNeXTUpdateInterval = 2000;  // อัพเดตจอทุก 2 วินาที
+bool beeNeXTConnected = false;
+
+// เพิ่มตัวแปรสำหรับเก็บสถานะอุปกรณ์
+bool fan_internal_state = false;
+bool fan_external_state = false;
+bool light_state = false;
+bool co2_state = false;
+bool cooling_pump_state = false;
+
+// เพิ่มตัวแปรสำหรับเก็บการตั้งค่าการควบคุมจาก MQTT
+struct ControlSettings {
+    // Internal Fan Settings
+    bool internal_fan_enabled = false;
+    int internal_fan_on_hour = 8;
+    int internal_fan_off_hour = 20;
+    unsigned long internal_fan_delay_on = 1800;  // วินาที
+    unsigned long internal_fan_delay_off = 900;  // วินาที
+    
+    // External Fan Settings
+    bool external_fan_enabled = false;
+    float external_fan_on_temp = 28.0;
+    float external_fan_off_temp = 25.0;
+    
+    // Light Settings
+    bool light_enabled = false;
+    int light_on_hour = 12;
+    int light_off_hour = 13;
+    unsigned long light_on_when = 5000;   // lux
+    unsigned long light_off_when = 15000; // lux
+    
+    // CO2 Settings
+    bool co2_enabled = false;
+    int co2_on_hour = 6;
+    int co2_off_hour = 18;
+    int co2_on_ppm = 400;
+    int co2_off_ppm = 1200;
+    
+    // EC/PH Settings
+    bool ec_ph_enabled = false;
+    unsigned long ec_ph_time_cycle = 28800; // วินาที (8 ชั่วโมง)
+    float target_ec = 2.2;
+    float kof_ec = 10.0;
+    float target_ph = 6.0;
+    float kof_ph = 1.0;
+    unsigned long agitator_delay = 3600000; // มิลลิวินาที
+    unsigned long last_ec_ph_cycle = 0;
+    
+    // Cooling Settings
+    bool cooling_enabled = false;
+    float cooling_on_temp = 25.0;
+    float cooling_off_temp = 22.0;
+    
+    // Circulation Pump Settings
+    bool circulation_enabled = false;
+    
+    // Water Level Check Settings
+    bool water_level_check_enabled = false;
+} controlSettings;
+
+// เพิ่มตัวแปรสำหรับการควบคุมแบบ cycle
+unsigned long lastControlExecutionTime = 0;
+const unsigned long controlExecutionInterval = 1000; // ตรวจสอบการควบคุมทุก 1 วินาที
+
+// ฟังก์ชันสำหรับดำเนินการควบคุมอย่างต่อเนื่อง
+void executeControlLogic() {
+    if (millis() - lastControlExecutionTime < controlExecutionInterval) {
+        return; // ยังไม่ถึงเวลาตรวจสอบ
+    }
+    
+    lastControlExecutionTime = millis();
+    
+    if (unixTimestamp == 0) {
+        return; // ยังไม่ได้รับ timestamp
+    }
+    
+    unsigned long currentHour = (unixTimestamp / 3600) % 24;
+    unsigned long currenttimeonlyhour = timeOnly;
+    String relayCommand = "RELAY:00000000";
+    bool needToSendCommand = false;
+
+    // 1. Internal Fan Control (K5 - พัดลมภายในตู้)
+    if (controlSettings.internal_fan_enabled) {
+        Serial.println("Internal fan enabled");
+        
+        // ตรวจสอบช่วงเวลาทำงานในวัน
+        bool timeInRange = false;
+        if (controlSettings.internal_fan_on_hour < controlSettings.internal_fan_off_hour) {
+            timeInRange = (currenttimeonlyhour >= controlSettings.internal_fan_on_hour && currenttimeonlyhour < controlSettings.internal_fan_off_hour);
+        } else {
+            timeInRange = (currenttimeonlyhour >= controlSettings.internal_fan_on_hour || currenttimeonlyhour < controlSettings.internal_fan_off_hour);
+        }
+        
+        if (timeInRange) {
+            // ระบบ cycling แบบ non-blocking ใช้ unixTimestamp
+            static unsigned long lastFanCycleTimestamp = 0;
+            static bool fanCycleState = false; // false = OFF period, true = ON period
+            
+            unsigned long currentTimestamp = unixTimestamp;
+            unsigned long cycleInterval;
+            
+            if (fanCycleState) {
+                // ช่วงเปิดพัดลม
+                cycleInterval = controlSettings.internal_fan_delay_on; // ใช้วินาทีโดยตรง
+                relayCommand.setCharAt(6 + 4, '1'); // K5 ON
+                
+                if (currentTimestamp - lastFanCycleTimestamp >= cycleInterval) {
+                    fanCycleState = false; // เปลี่ยนเป็นช่วงปิด
+                    lastFanCycleTimestamp = currentTimestamp;
+                    Serial.println("🌀 Internal fan cycle: ON period completed, switching to OFF");
+                }
+            } else {
+                // ช่วงปิดพัดลม
+                cycleInterval = controlSettings.internal_fan_delay_off; // ใช้วินาทีโดยตรง
+                // K5 OFF (ไม่ต้องเซ็ต เพราะ relayCommand เริ่มต้นเป็น 0)
+                
+                if (currentTimestamp - lastFanCycleTimestamp >= cycleInterval) {
+                    fanCycleState = true; // เปลี่ยนเป็นช่วงเปิด
+                    lastFanCycleTimestamp = currentTimestamp;
+                    Serial.println("🌀 Internal fan cycle: OFF period completed, switching to ON");
+                }
+            }
+            
+            // อัพเดทสถานะ
+            if (fanCycleState != fan_internal_state) {
+                fan_internal_state = fanCycleState;
+                needToSendCommand = true;
+                Serial.println("🌀 Internal fan (K5) " + String(fanCycleState ? "ON" : "OFF") + " - Natural wind simulation");
+            }
+            
+        } else {
+            // นอกช่วงเวลาทำงาน - ปิดพัดลม
+            if (fan_internal_state) {
+                fan_internal_state = false;
+                needToSendCommand = true;
+                Serial.println("🌀 Internal fan OFF (K5) - Outside time range");
+            }
+        }
+    }
+    
+    // 2. External Fan Control (K3 - พัดลมระบายอากาศ)
+    if (controlSettings.external_fan_enabled) {
+        Serial.println("External fan enabled");
+        bool shouldBeOn = false;
+        if (airTemperature >= controlSettings.external_fan_on_temp) {
+            shouldBeOn = true;
+        } else if (airTemperature <= controlSettings.external_fan_off_temp) {
+            shouldBeOn = false;
+        } else {
+            shouldBeOn = fan_external_state; // Keep current state (hysteresis)
+        }
+        
+        if (shouldBeOn != fan_external_state) {
+            fan_external_state = shouldBeOn;
+            needToSendCommand = true;
+            Serial.println("🌪️ External fan " + String(shouldBeOn ? "ON" : "OFF") + " (K3) - Temp: " + String(airTemperature) + "°C");
+        }
+        
+        if (shouldBeOn) {
+            relayCommand.setCharAt(6 + 2, '1'); // K3 - พัดลมระบายอากาศ
+        }
+    }
+    
+    // 3. Light_co2 Control K1
+    if (controlSettings.light_enabled) {
+        // Serial.println("Light enabled");
+        Serial.println("Light on hour: " + String(controlSettings.light_on_hour));
+        Serial.println("Light off hour: " + String(controlSettings.light_off_hour));
+        Serial.println("Current hour: " + String(currenttimeonlyhour));
+
+        bool timeCondition = false;
+        if (controlSettings.light_on_hour < controlSettings.light_off_hour) {
+            // Serial.println("Light on hour < off hour");
+            timeCondition = (currenttimeonlyhour >= controlSettings.light_on_hour && currenttimeonlyhour < controlSettings.light_off_hour);
+        } else {
+            // Serial.println("Light on hour > off hour");
+            timeCondition = (currenttimeonlyhour >= controlSettings.light_on_hour || currenttimeonlyhour < controlSettings.light_off_hour);
+        }
+        // Serial.println("light" + String(lightValue));
+        bool lightCondition = (lightValue < controlSettings.light_on_when);
+        bool shouldBeOn = timeCondition && lightCondition;
+        
+        Serial.println("Time condition: " + String(timeCondition));
+        Serial.println("Light condition: " + String(lightCondition));
+        Serial.println("Should be ON: " + String(shouldBeOn));
+        if (lightValue > 1000 || !timeCondition) {
+            shouldBeOn = false;
+        }
+        
+        if (shouldBeOn != light_state) {
+            light_state = shouldBeOn;
+            needToSendCommand = true;
+            Serial.println("💡 Light " + String(shouldBeOn ? "ON" : "OFF") + " - Time: " + String(currentHour) + "h, Light: " + String(lightValue) + " lux");
+        }
+        
+        if (shouldBeOn) {
+            Serial.println("Light should be on");
+            relayCommand.setCharAt(6 + 0, '1'); // K1
+        }
+    }
+    
+    // 4. CO2 (light_co2) Control
+    if (controlSettings.co2_enabled) {
+        Serial.println("CO2 enabled");
+        bool timeCondition = false;
+        // if (controlSettings.co2_on_hour < controlSettings.co2_off_hour) {
+        //     timeCondition = (currentHour >= controlSettings.co2_on_hour && currentHour < controlSettings.co2_off_hour);
+        // } else {
+        //     timeCondition = (currentHour >= controlSettings.co2_on_hour || currentHour < controlSettings.co2_off_hour);
+        // }
+        
+        bool co2Condition = (co2Value < controlSettings.co2_on_ppm);
+        bool fanNotRunning = !fan_external_state;
+        // bool shouldBeOn = timeCondition && co2Condition && fanNotRunning;
+        bool shouldBeOn = co2Condition; 
+        
+        if (co2Value > controlSettings.co2_off_ppm) {
+            shouldBeOn = false;
+        }
+        
+        if (shouldBeOn != co2_state) {
+            co2_state = shouldBeOn;
+            needToSendCommand = true;
+            Serial.println("🌱 CO2 " + String(shouldBeOn ? "ON" : "OFF") + " - CO2: " + String(co2Value) + " ppm, Fan: " + String(fan_external_state ? "ON" : "OFF"));
+        }
+        
+        if (shouldBeOn) {
+            relayCommand.setCharAt(6 + 7, '1'); // K8
+        }
+    }
+    
+    // 5. EC/PH Control (Using Unix Timestamp - Real Time)
+    if (controlSettings.ec_ph_enabled) {
+        
+        // ใช้ Unix Timestamp แทน millis() เพื่อความแม่นยำ
+        static unsigned long lastECPHCycle = 0;
+        static bool ecphCycleActive = false;
+        
+        unsigned long cycleInterval = controlSettings.ec_ph_time_cycle; // วินาที (ไม่ต้องแปลง)
+        Serial.println("Cycle interval: " + String(cycleInterval));
+        
+        // ตรวจสอบว่าถึงเวลาเริ่ม cycle ใหม่หรือไม่ (ใช้เวลาจริง)
+        if (!ecphCycleActive && unixTimestamp > 0 && (unixTimestamp - lastECPHCycle >= cycleInterval)) {
+            ecphCycleActive = true;
+            lastECPHCycle = unixTimestamp;
+            
+            Serial.println("EC/PH enabled");
+            Serial.println("Cycle time: " + String(controlSettings.ec_ph_time_cycle) + " seconds");
+            Serial.println("🧪 EC/PH Cycle Started (Real Time) - Target EC: " + String(controlSettings.target_ec) + ", Target PH: " + String(controlSettings.target_ph));
+            Serial.println("🕐 Current Unix Time: " + String(unixTimestamp) + ", Last Cycle: " + String(lastECPHCycle));
+            
+            // เปิดปั๊มวัด (K4)
+            // relayCommand.setCharAt(6 + 3, '1');
+            
+            // === ชุดจ่ายปุ๋ย A, B (EC Control) ===
+            // E_error = EC - ECที่วัดได้
+            float E_error = controlSettings.target_ec - ecValue;
+            Serial.println("📊 EC Analysis: Target=" + String(controlSettings.target_ec) + ", Current=" + String(ecValue) + ", Error=" + String(E_error));
+           
+            Serial.println("E_error: " + String(E_error));
+            Serial.println("controlSettings.target_ec: " + String(controlSettings.target_ec));
+            Serial.println("ecValue: " + String(ecValue));
+
+            if (E_error > 0) {
+                // ระยะเวลาในการเติมสาร = E_error * KofEC
+                unsigned long ecPumpDuration = (unsigned long)(E_error * controlSettings.kof_ec * 1000);
+                
+                // เติมสารตามจำนวน -> ระยะเวลาในการเติมสาร
+                relayCommand.setCharAt(6 + 6, '1'); // K7 - ชุดจ่ายปุ๋ย A,B
+                ecPumpRunning = true;
+                ecPumpStartTime = millis();
+                ecPumpDuration = ecPumpDuration;
+                
+                String ecPumpCommand = "PUMP_TIMING:EC," + String(ecPumpDuration);
+                Serial2.println(ecPumpCommand);
+                Serial.println("🧪 ชุดจ่ายปุ๋ย A,B: EC Error=" + String(E_error) + ", Duration=" + String(ecPumpDuration) + " ms");
+            } else {
+                Serial.println("✅ EC Level OK - No fertilizer needed");
+            }
+            
+            // === ชุดจ่ายกรดไนตริก (PH Control) ===
+            // P_error = PH - PHที่วัดได้
+            float P_error = controlSettings.target_ph - waterPH;
+            Serial.println("📊 PH Analysis: Target=" + String(controlSettings.target_ph) + ", Current=" + String(waterPH) + ", Error=" + String(P_error));
+            
+            if (P_error != 0) {
+                // ระยะเวลาในการเติมสาร = P_error * KofPH
+                unsigned long phPumpDuration = (unsigned long)(abs(P_error) * controlSettings.kof_ph * 1000);
+                
+                // เติมสารตามจำนวน -> ระยะเวลาในการเติมสาร
+                relayCommand.setCharAt(6 + 5, '1'); // K6 - ชุดจ่ายกรดไนตริก
+                phPumpRunning = true;
+                phPumpStartTime = millis();
+                phPumpDuration = phPumpDuration;
+                
+                String phPumpCommand = "PUMP_TIMING:PH," + String(phPumpDuration);
+                Serial2.println(phPumpCommand);
+                Serial.println("🧪 ชุดจ่ายกรดไนตริก: PH Error=" + String(P_error) + ", Duration=" + String(phPumpDuration) + " ms");
+            } else {
+                Serial.println("✅ PH Level OK - No acid needed");
+            }
+            
+            needToSendCommand = true;
+            
+            // ส่งคำสั่ง relay
+            if (needToSendCommand) {
+                Serial2.println(relayCommand);
+                Serial.println("🔄 Sent EC/PH control command: " + relayCommand);
+            }
+            
+            // แสดงข้อมูลการรอ cycle ถัดไป (ใช้เวลาจริง)
+            unsigned long nextCycleTime = unixTimestamp + cycleInterval;
+            Serial.println("🔄 EC/PH cycle completed, next cycle in " + String(controlSettings.ec_ph_time_cycle) + " seconds");
+            Serial.println("⏰ Next cycle at Unix time: " + String(nextCycleTime));
+            Serial.println("⏳ System continues running normally while waiting...");
+            
+            // รีเซ็ตสถานะเพื่อรอ cycle ถัดไป
+            ecphCycleActive = false;
+        }
+    }
+    
+    // 6. Cooling Control
+    if (controlSettings.cooling_enabled) {
+
+        bool shouldBeOn = false;
+        if (waterTemperature >= controlSettings.cooling_on_temp) {
+            // Serial.println("Cooling on");
+            shouldBeOn = true;
+        } else if (waterTemperature <= controlSettings.cooling_off_temp) {
+            // Serial.println("Cooling off");
+            shouldBeOn = false;
+        } else {
+            // Serial.println("Cooling off");
+            shouldBeOn = cooling_pump_state; // Keep current state (hysteresis)
+        }
+        
+        if (shouldBeOn != cooling_pump_state) {
+            // Serial.println("Cooling state changed");
+            cooling_pump_state = shouldBeOn;
+            needToSendCommand = true;
+            Serial.println("❄️ Cooling " + String(shouldBeOn ? "ON" : "OFF") + " - Water temp: " + String(waterTemperature) + "°C");
+        }
+        
+        if (shouldBeOn) {
+            // Serial.println("Cooling should be on");
+            relayCommand.setCharAt(6 + 1, '1'); // K2
+        }
+    }
+    
+    // 7. Circulation Pump (Always ON when enabled)
+    if (controlSettings.circulation_enabled) {
+        Serial.println("Circulation pump enabled");
+        static unsigned long lastFlowCheck = 0;
+        if (millis() - lastFlowCheck >= 10000) { // ตรวจสอบทุก 10 วินาที
+            lastFlowCheck = millis();
+            
+            if (flowRate1 <= 0.1) {
+                Serial.println("⚠️ WARNING: Low flow rate! " + String(flowRate1) + " L/min");
+                String alertCommand = "FLOW_ALERT:LOW_FLOW," + String(flowRate1);
+                Serial2.println(alertCommand);
+            }
+            
+            String pumpCommand = "CIRCULATION_PUMP:ON";
+            Serial2.println(pumpCommand);
+        }
+    }
+    
+    // 8. Water Level Check
+    if (controlSettings.water_level_check_enabled) {
+        Serial.println("Water level check enabled");
+        static unsigned long lastWaterLevelCheck = 0;
+        if (millis() - lastWaterLevelCheck >= 30000) { // ตรวจสอบทุก 30 วินาที
+            lastWaterLevelCheck = millis();
+            
+            if (waterLevel < 20) {
+                Serial.println("⚠️ WARNING: Low water level! " + String(waterLevel) + "%");
+                String alertCommand = "WATER_ALERT:LOW_LEVEL," + String(waterLevel);
+                Serial2.println(alertCommand);
+            } else if (waterLevel > 90) {
+                Serial.println("⚠️ WARNING: High water level! " + String(waterLevel) + "%");
+                String alertCommand = "WATER_ALERT:HIGH_LEVEL," + String(waterLevel);
+                Serial2.println(alertCommand);
+            }
+        }
+    }
+    
+    // ส่งคำสั่ง relay ถ้ามีการเปลี่ยนแปลง
+    if (needToSendCommand) {
+        Serial2.println(relayCommand);
+        Serial.println("🔄 Sent continuous control command: " + relayCommand);
+    }
+}
+
+// ฟังก์ชันสำหรับอัปเดตการตั้งค่าจากคำสั่ง MQTT
+void updateControlSettings(JsonDocument& doc) {
+    String command = doc["command"].as<String>();
+    
+    if (command == "Internal_cooling_fan") {
+        controlSettings.internal_fan_enabled = true;
+        controlSettings.internal_fan_on_hour = doc["value"]["on"];
+        controlSettings.internal_fan_off_hour = doc["value"]["off"];
+        controlSettings.internal_fan_delay_on = doc["value"]["delay_on"];
+        controlSettings.internal_fan_delay_off = doc["value"]["delay_off"];
+        Serial.println("✅ Updated Internal Fan Settings - ON: " + String(controlSettings.internal_fan_on_hour) + "h, OFF: " + String(controlSettings.internal_fan_off_hour) + "h");
+    }
+     if (command == "External_cooling_fan") {
+        controlSettings.external_fan_enabled = true;
+        controlSettings.external_fan_on_temp = doc["value"]["on_temperature_when"];
+        controlSettings.external_fan_off_temp = doc["value"]["off_temperature_when"];
+        Serial.println("✅ Updated External Fan Settings - ON: " + String(controlSettings.external_fan_on_temp) + "°C, OFF: " + String(controlSettings.external_fan_off_temp) + "°C");
+    }
+    if (command == "light_control") {
+        controlSettings.light_enabled = true;
+        controlSettings.light_on_hour = doc["value"]["on"];
+        controlSettings.light_off_hour = doc["value"]["off"];
+        controlSettings.light_on_when = doc["value"]["light_on_when"];
+        controlSettings.light_off_when = doc["value"]["light_off_when"];
+        Serial.println("✅ Updated Light Settings - ON: " + String(controlSettings.light_on_hour) + "h, OFF: " + String(controlSettings.light_off_hour) + "h");
+    }
+    //  if (command == "co2_control") {
+    //     controlSettings.co2_enabled = true;
+    //     controlSettings.co2_on_hour = doc["value"]["on"];
+    //     controlSettings.co2_off_hour = doc["value"]["off"];
+    //     controlSettings.co2_on_ppm = doc["value"]["co2_on"];
+    //     controlSettings.co2_off_ppm = doc["value"]["co2_off"];
+    //     Serial.println("✅ Updated CO2 Settings - ON: " + String(controlSettings.co2_on_hour) + "h, OFF: " + String(controlSettings.co2_off_hour) + "h");
+    // }
+     if (command == "EC_PH") {
+        controlSettings.ec_ph_enabled = true;
+        if (doc["value"].containsKey("time_cycle")) {
+            controlSettings.ec_ph_time_cycle = doc["value"]["time_cycle"];
+        }
+        controlSettings.target_ec = doc["value"]["EC"];
+        controlSettings.kof_ec = doc["value"]["KofEC"];
+        controlSettings.target_ph = doc["value"]["PH"];
+        controlSettings.kof_ph = doc["value"]["KofPH"];
+        controlSettings.agitator_delay = doc["value"]["AgitatorPump_delay"];
+        Serial.println("✅ Updated EC/PH Settings - EC: " + String(controlSettings.target_ec) + ", PH: " + String(controlSettings.target_ph));
+    }
+     if (command == "Cooling") {
+        controlSettings.cooling_enabled = true;
+        controlSettings.cooling_on_temp = doc["value"]["on_cooling_when"];
+        controlSettings.cooling_off_temp = doc["value"]["off_cooling_when"];
+        Serial.println("✅ Updated Cooling Settings - ON: " + String(controlSettings.cooling_on_temp) + "°C, OFF: " + String(controlSettings.cooling_off_temp) + "°C");
+    }
+    if (command == "circulation_pump") {
+        controlSettings.circulation_enabled = true;
+        Serial.println("✅ Enabled Circulation Pump Control");
+    }
+    if (command == "water_level_check") {
+        controlSettings.water_level_check_enabled = true;
+        Serial.println("✅ Enabled Water Level Monitoring");
+    }
+    if (command == "light_co2") {
+        // รวมคำสั่งไฟและ CO2
+        controlSettings.light_enabled = true;
+        controlSettings.co2_enabled = true;
+        controlSettings.light_on_hour = doc["value"]["on"];
+        controlSettings.light_off_hour = doc["value"]["off"];
+        controlSettings.co2_on_hour = doc["value"]["on"];
+        controlSettings.co2_off_hour = doc["value"]["off"];
+        controlSettings.co2_on_ppm = doc["value"]["co2_on"];//ใช้
+        controlSettings.co2_off_ppm = doc["value"]["co2_off"];//ใช้
+        controlSettings.light_on_when = 10000;  // ค่าเริ่มต้น
+        controlSettings.light_off_when = 15000; // ค่าเริ่มต้น
+        Serial.println("✅ Updated Light+CO2 Settings - ON: " + String(controlSettings.light_on_hour) + "h, OFF: " + String(controlSettings.light_off_hour) + "h");
+    }
+}
+
+// ฟังก์ชันสำหรับควบคุมอุปกรณ์แบบ manual
+void controlDevice(int pin, bool state, String deviceName) {
+    digitalWrite(pin, state ? HIGH : LOW);
+    if (debugEnabled) {
+        Serial.println(deviceName + (state ? " ON" : " OFF"));
+    }
+}
+
+// ฟังก์ชันสำหรับอัพเดตสถานะอุปกรณ์ทั้งหมด
+void updateDeviceStates() {
+    controlDevice(fan_internal_pin, fan_internal_state, "Internal Fan");
+    controlDevice(fan_external_pin, fan_external_state, "External Fan");
+    controlDevice(light_pin, light_state, "Light");
+    controlDevice(co2_pin, co2_state, "CO2");
+    controlDevice(cooling_pump_pin, cooling_pump_state, "Cooling Pump");
+}
+
+// ฟังก์ชันสำหรับรีเซ็ตสถานะอุปกรณ์ทั้งหมด
+void resetAllDevices() {
+    fan_internal_state = false;
+    fan_external_state = false;
+    light_state = false;
+    co2_state = false;
+    cooling_pump_state = false;
+    updateDeviceStates();
+    if (debugEnabled) {
+        Serial.println("🔄 All devices reset to OFF state");
+    }
+}
+
+// ฟังก์ชันสำหรับแสดงข้อความดีบัก (ย้ายมาไว้ก่อน executeControlLogic)
+void debugPrint(String message) {
+  if (debugEnabled) {
+    Serial.println(message);
+  }
+}
+
+// ฟังก์ชันสำหรับเชื่อมต่อ MQTT
+void connectToMQTT() {
+    // ลองเชื่อมต่อจนกว่าจะสำเร็จ
+    while (!client.connected()) {
+        Serial.println("Connecting to MQTT...");
+        // สร้าง client ID ที่ไม่ซ้ำกัน
+        String clientId = "ESP32S3Client-";
+        clientId += String(random(0xffff), HEX);
+        
+        if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+            Serial.println("✅ Connected to MQTT!");
+            
+            // Subscribe ไปยัง topics ที่ต้องการ
+            sprintf(topic_control, "cabinets/%s/control", cabinetId);
+            
+            // ตรวจสอบการ subscribe topic control ที่ถูกต้อง
+            if (client.subscribe(topic_control)) {
+                Serial.println("📡 Subscribed to control topic: " + String(topic_control));
+            }
+            
+            // เพิ่มการ subscribe สำหรับ timesync
+            if (client.subscribe("timesync2")) {
+                Serial.println("📡 Subscribed to: timesync2");
+            }
+            
+            // Subscribe สำหรับ BeeNeXT (รับข้อมูลกลับจากจอ)
+            char beeNeXTDataTopic[64];
+            sprintf(beeNeXTDataTopic, "cabinets/%s/data", cabinetId);
+            if (client.subscribe(beeNeXTDataTopic)) {
+                Serial.println("📺 Subscribed to BeeNeXT data topic: " + String(beeNeXTDataTopic));
+            }
+            
+        } else {
+            Serial.println("⚠️ Failed to connect to MQTT, rc=" + String(client.state()));
+            Serial.println("Retrying in 2 seconds...");
+            delay(2000);
+        }
+    }
+}
+
+// ฟังก์ชันสำหรับส่งข้อมูล JSON ไปยัง MQTT (รับค่า float)
+void publishSensorData(const char* sensorName, float value) {
+    // ลบเงื่อนไขการตรวจสอบค่า 0 ออก
+    if (!client.connected() || unixTimestamp == 0) {
+        return;
+    }
+    
+    // สร้าง JSON document
+    StaticJsonDocument<256> jsonDoc;
+    
+    // เพิ่มข้อมูลตามรูปแบบที่กำหนด
+    jsonDoc["cabinet_id"] = cabinetId;
+    jsonDoc["sensor"] = sensorName;
+    jsonDoc["value"] = value;
+    jsonDoc["timestamp"] = unixTimestamp;
+    
+    // แปลง JSON เป็น string
+    char jsonBuffer[256];
+    serializeJson(jsonDoc, jsonBuffer);
+    
+    // สร้าง topic สำหรับส่งข้อมูล
+    char topic[50];
+    sprintf(topic, "cabinets/%s/data", cabinetId);
+    
+    // ส่งข้อมูลไปยัง MQTT server
+    client.publish(topic, jsonBuffer);
+}
+
+// ฟังก์ชันสำหรับส่งข้อมูล JSON ที่มีค่าเป็น Object
+void publishSensorDataObject(const char* sensorName, const JsonObject& valueObj) {
+    if (!client.connected() || unixTimestamp == 0) {
+        return;
+    }
+    
+    // สร้าง JSON document
+    StaticJsonDocument<256> jsonDoc;
+    
+    // เพิ่มข้อมูลตามรูปแบบที่กำหนด
+    jsonDoc["cabinet_id"] = cabinetId;
+    jsonDoc["sensor"] = sensorName;
+    jsonDoc["value"] = valueObj;
+    jsonDoc["timestamp"] = unixTimestamp;
+    
+    // แปลง JSON เป็น string
+    char jsonBuffer[256];
+    serializeJson(jsonDoc, jsonBuffer);
+    
+    // สร้าง topic สำหรับส่งข้อมูล
+    char topic[50];
+    sprintf(topic, "cabinets/%s/data", cabinetId);
+    
+    // ส่งข้อมูลไปยัง MQTT server
+    client.publish(topic, jsonBuffer);
+}
+// ส่งคำสั่งไปยัง Arduino Mega
+void sendJsonCommandToMega(JsonDocument& doc) {
+  String output;
+  serializeJson(doc, output);
+  Serial2.println(output);
+}
+
+// ฟังก์ชันแปลงคำสั่ง JSON เป็นคำสั่ง String สำหรับ relay
+String convertJsonToRelayCommand(JsonDocument& doc) {
+    String command = doc["command"].as<String>();
+    
+    // สร้างคำสั่ง relay เริ่มต้น (ปิดทุก relay)
+    // รูปแบบ: "RELAY:12345678" โดย 1=เปิด, 0=ปิด
+    // ตำแหน่ง: // === Relay8 Control (D26-D33) ===
+// #define RELAY_IN1    26  // K1 - ชุดหลอดไฟ
+// #define RELAY_IN2    27  // K2 - ชุดทำความเย็น
+// #define RELAY_IN3    28  // K3 - External Fan Control
+// #define RELAY_IN4    29  // K4 - ปั๊มสารละลายขึ้นรางปลูก
+// #define RELAY_IN5    30  // K5 - Internal Fan Control 
+// #define RELAY_IN6    31  // K6 - ชุดจ่ายกรดไนตริก,ปั๊มกวนสารละลาย
+// #define RELAY_IN7    32  // K7 - ชุดจ่ายสารละลาย A,B
+// #define RELAY_IN8    33  // K8 - ชุดจ่าย CO2
+
+    String relayCommand = "RELAY:00000000";
+    bool commandProcessed = false;
+    
+    // 1. ควบคุมพัดลมภายในตู้ (Internal Cooling Fan) -> K5 (พัดลมภายในตู้)
+    // ตั้งเวลาเริ่ม/หยุด และระยะเวลาเปิด/ปิดสลับกัน
+    if (command == "Internal_cooling_fan") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on") || 
+            !doc["value"].containsKey("off") || !doc["value"].containsKey("delay_on") || 
+            !doc["value"].containsKey("delay_off")) {
+            Serial.println("⚠️ Missing required parameters for Internal_cooling_fan");
+            return "";
+        }
+        
+        int on = doc["value"]["on"];
+        int off = doc["value"]["off"];
+        unsigned long delay_on = doc["value"]["delay_on"];  // เวลาเปิด (วินาที)
+        unsigned long delay_off = doc["value"]["delay_off"]; // เวลาปิด (วินาที)
+        unsigned long currentHour = (unixTimestamp / 3600) % 24;
+
+        Serial.println("Internal cooling fan control (K5 - พัดลมภายในตู้)");
+        Serial.println("ON time: " + String(on) + ", OFF time: " + String(off));
+        Serial.println("Delay ON: " + String(delay_on) + "s, Delay OFF: " + String(delay_off) + "s");
+        Serial.println("Current hour: " + String(currentHour));
+
+        // ตรวจสอบช่วงเวลาทำงาน
+        bool shouldBeOn = false;
+        if (on < off) {
+            shouldBeOn = (currentHour >= on && currentHour < off);
+        } else {
+            shouldBeOn = (currentHour >= on || currentHour < off);
+        }
+        
+        if (shouldBeOn) {
+            // เปิดพัดลมภายใน (K5 - ตำแหน่งที่ 4)
+            relayCommand.setCharAt(6 + 4, '1');
+            fan_internal_state = true;
+            Serial.println("🌀 Internal fan ON (K5) - Natural wind simulation");
+            
+            // ส่งคำสั่งการทำงานแบบสลับเปิด/ปิด
+            String fanCycleCommand = "FAN_CYCLE:INTERNAL," + String(delay_on) + "," + String(delay_off);
+            Serial2.println(fanCycleCommand);
+            Serial.println("Sent fan cycle command: " + fanCycleCommand);
+        } else {
+            fan_internal_state = false;
+            Serial.println("🌀 Internal fan OFF (K5)");
+        }
+    }
+    
+    // 2. ควบคุมพัดลมระบายอากาศ (External Cooling Fan) -> K3 (พัดลมระบายอากาศ)
+    // ควบคุมด้วยเงื่อนไขอุณหภูมิอากาศ
+    if (command == "External_cooling_fan") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on_temperature_when") || 
+            !doc["value"].containsKey("off_temperature_when")) {
+            Serial.println("⚠️ Missing required parameters for External_cooling_fan");
+            return "";
+        }
+        
+        float on_temp = doc["value"]["on_temperature_when"];
+        float off_temp = doc["value"]["off_temperature_when"];
+
+        Serial.println("External cooling fan control (K3 - พัดลมระบายอากาศ)");
+        Serial.println("ON when temp >= " + String(on_temp) + "°C, OFF when temp <= " + String(off_temp) + "°C");
+        Serial.println("Current temperature: " + String(airTemperature) + "°C");
+
+        if (airTemperature >= on_temp) {
+            // เปิดพัดลมระบายอากาศ (K3 - ตำแหน่งที่ 2)
+            relayCommand.setCharAt(6 + 2, '1');
+            fan_external_state = true;
+            Serial.println("🌪️ External fan ON (K3) - Temperature control");
+        } else if (airTemperature <= off_temp) {
+            fan_external_state = false;
+            Serial.println("🌪️ External fan OFF (K3)");
+        }
+    }
+    
+    // 3. ควบคุมหลอดไฟ (Light) -> K1 (ชุดหลอดไฟ)
+    // ควบคุมด้วยการตั้งเวลาเปิด/ปิด และเงื่อนไขความสว่าง
+    if (command == "light_control") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on") || 
+            !doc["value"].containsKey("off") || !doc["value"].containsKey("light_on_when") || 
+            !doc["value"].containsKey("light_off_when")) {
+            Serial.println("⚠️ Missing required parameters for light_control");
+            return "";
+        }
+        
+        int light_on_hour = doc["value"]["on"];
+        int light_off_hour = doc["value"]["off"];
+        unsigned long light_on_when = doc["value"]["light_on_when"];   // ความสว่างน้อยกว่าค่านี้ให้เปิด
+        unsigned long light_off_when = doc["value"]["light_off_when"]; // ความสว่างสูงกว่าค่านี้ให้ปิด
+        unsigned long currentHour = (unixTimestamp / 3600) % 24;
+
+        Serial.println("Light control (K1 - ชุดหลอดไฟ)");
+        Serial.println("Time ON: " + String(light_on_hour) + ", Time OFF: " + String(light_off_hour));
+        Serial.println("Light ON when < " + String(light_on_when) + " lux, OFF when > " + String(light_off_when) + " lux");
+        Serial.println("Current hour: " + String(currentHour) + ", Current light: " + String(lightValue) + " lux");
+        
+        // ตรวจสอบเงื่อนไขเวลา
+        bool timeCondition = false;
+        if (light_on_hour < light_off_hour) {
+            timeCondition = (currentHour >= light_on_hour && currentHour < light_off_hour);
+        } else {
+            timeCondition = (currentHour >= light_on_hour || currentHour < light_off_hour);
+        }
+        
+        // ตรวจสอบเงื่อนไขความสว่าง
+        bool lightCondition = (lightValue < light_on_when);
+        
+        if (timeCondition && lightCondition) {
+            // เปิดไฟ (K1 - ตำแหน่งที่ 0)
+            relayCommand.setCharAt(6 + 0, '1');
+            light_state = true;
+            Serial.println("Turn ON light (K1) - Time & Light conditions met");
+        } else if (lightValue > light_off_when || !timeCondition) {
+            light_state = false;
+            Serial.println("Turn OFF light (K1) - Conditions not met");
+        }
+    }
+    
+    // 4. ควบคุมเครื่องจ่าย CO2 -> K8 (ชุดจ่าย CO2)
+    // ควบคุมด้วยการตั้งเวลาเปิด/ปิด และเงื่อนไขปริมาณ CO2
+    // CO2 จะไม่เปิดถ้าพัดลมระบายอากาศเปิดอยู่
+    if (command == "co2_control") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on") || 
+            !doc["value"].containsKey("off") || !doc["value"].containsKey("co2_on") || 
+            !doc["value"].containsKey("co2_off")) {
+            Serial.println("⚠️ Missing required parameters for co2_control");
+            return "";
+        }
+        
+        int co2_on_hour = doc["value"]["on"];
+        int co2_off_hour = doc["value"]["off"];
+        int co2_on = doc["value"]["co2_on"];   // CO2 น้อยกว่าค่านี้ให้เปิด
+        int co2_off = doc["value"]["co2_off"]; // CO2 สูงกว่าค่านี้ให้ปิด
+        unsigned long currentHour = (unixTimestamp / 3600) % 24;
+
+        Serial.println("CO2 control (K8 - ชุดจ่าย CO2)");
+        Serial.println("Time ON: " + String(co2_on_hour) + ", Time OFF: " + String(co2_off_hour));
+        Serial.println("CO2 ON when < " + String(co2_on) + " ppm, OFF when > " + String(co2_off) + " ppm");
+        Serial.println("Current hour: " + String(currentHour) + ", Current CO2: " + String(co2Value) + " ppm");
+        Serial.println("External fan state: " + String(fan_external_state ? "ON" : "OFF"));
+        
+        // ตรวจสอบเงื่อนไขเวลา
+        bool timeCondition = false;
+        if (co2_on_hour < co2_off_hour) {
+            timeCondition = (currentHour >= co2_on_hour && currentHour < co2_off_hour);
+        } else {
+            timeCondition = (currentHour >= co2_on_hour || currentHour < co2_off_hour);
+        }
+        
+        // ตรวจสอบเงื่อนไข CO2 และพัดลมระบายอากาศ
+        bool co2Condition = (co2Value < co2_on);
+        bool fanNotRunning = !fan_external_state; // CO2 ไม่เปิดถ้าพัดลมระบายอากาศเปิดอยู่
+        
+        if (timeCondition && co2Condition && fanNotRunning) {
+            // เปิด CO2 (K8 - ตำแหน่งที่ 7)
+            relayCommand.setCharAt(6 + 7, '1');
+            co2_state = true;
+            Serial.println("Turn ON CO2 (K8) - All conditions met");
+        } else if (co2Value > co2_off || !timeCondition || !fanNotRunning) {
+            co2_state = false;
+            if (!fanNotRunning) {
+                Serial.println("Turn OFF CO2 (K8) - External fan is running");
+            } else {
+                Serial.println("Turn OFF CO2 (K8) - Conditions not met");
+            }
+        }
+    }
+    
+    // 5. ชุดจ่ายปุ๋ย A, B (EC Control) -> K7 (ชุดจ่ายสารละลาย A,B)
+    // 6. ชุดจ่ายกรดไนตริก (PH Control) -> K6 (ชุดจ่ายกรดไนตริก)
+    // 9. ปั๊มกวนสารละลาย -> K5 (ปั๊มผสมสารละลาย)
+    if (command == "EC_PH") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || 
+            !doc["value"].containsKey("EC") || 
+            !doc["value"].containsKey("KofEC") || 
+            !doc["value"].containsKey("PH") || 
+            !doc["value"].containsKey("KofPH") || 
+            !doc["value"].containsKey("AgitatorPump_delay")) {
+            Serial.println("⚠️ Missing required parameters for EC_PH");
+            return "";
+        }
+        
+        float targetEC = doc["value"]["EC"];
+        float kofEC = doc["value"]["KofEC"];
+        float targetPH = doc["value"]["PH"];
+        float kofPH = doc["value"]["KofPH"];
+        unsigned long agitatorDelay = doc["value"]["AgitatorPump_delay"];
+        
+        // จัดการ time_cycle (ระยะเวลาในแต่ละรอบ)
+        static unsigned long lastCycleTime = 0;
+        unsigned long time_cycle = 0;
+        
+        if (doc["value"].containsKey("time_cycle")) {
+            time_cycle = doc["value"]["time_cycle"].as<unsigned long>() * 1000; // แปลงเป็น milliseconds
+        }
+        
+        // ตรวจสอบว่าถึงเวลา cycle หรือไม่
+        bool shouldRun = true;
+        if (time_cycle > 0) {
+            if (currentMillis - lastCycleTime >= time_cycle) {
+                lastCycleTime = currentMillis;
+                shouldRun = true;
+            } else {
+                shouldRun = false;
+            }
+        }
+        
+        if (shouldRun) {
+            Serial.println("EC and PH control (K4-ปั๊มวัด, K5-ปั๊มผสม, K6-กรด, K7-EC)");
+            Serial.println("Target EC: " + String(targetEC) + ", Current EC: " + String(ecValue));
+            Serial.println("Target PH: " + String(targetPH) + ", Current PH: " + String(waterPH));
+            Serial.println("Agitator delay: " + String(agitatorDelay) + " ms");
+
+            // คำนวณค่าผิดพลาด
+            float ecError = targetEC - ecValue;
+            float phError = targetPH - waterPH;
+
+            // เปิดปั๊มวัดค่า EC และ PH (K4 - ตำแหน่งที่ 3)
+            relayCommand.setCharAt(6 + 3, '1');
+            
+            // เปิดปั๊มผสมสารละลาย (K5 - ตำแหน่งที่ 4) - ปั๊มกวนสาร
+            relayCommand.setCharAt(6 + 4, '1');
+            agitatorPumpRunning = true;
+            agitatorPumpStartTime = currentMillis;
+            agitatorPumpDelay = agitatorDelay;
+            
+            // ส่งคำสั่งเวลาทำงานของปั๊มกวนสาร
+            String pumpTimingCommand = "PUMP_TIMING:AGITATOR," + String(agitatorDelay);
+            Serial2.println(pumpTimingCommand);
+            Serial.println("Sent agitator pump timing command: " + pumpTimingCommand);
+
+            // 5. ควบคุมปั๊ม EC (K7 - ชุดจ่ายสารละลาย A,B)
+            if (ecError > 0) {
+                relayCommand.setCharAt(6 + 6, '1');
+                ecPumpRunning = true;
+                ecPumpStartTime = currentMillis;
+                ecPumpDuration = (unsigned long)(ecError * kofEC * 1000);
+                Serial.println("EC is low - Turning ON EC pump (K7) for " + String(ecPumpDuration) + " ms");
+                
+                String ecPumpCommand = "PUMP_TIMING:EC," + String(ecPumpDuration);
+                Serial2.println(ecPumpCommand);
+                Serial.println("Sent EC pump timing command: " + ecPumpCommand);
+            }
+
+            // 6. ควบคุมปั๊ม PH (K6 - ชุดจ่ายกรดไนตริก)
+            if (phError != 0) {
+                relayCommand.setCharAt(6 + 5, '1');
+                phPumpRunning = true;
+                phPumpStartTime = currentMillis;
+                phPumpDuration = (unsigned long)(abs(phError) * kofPH * 1000);
+                Serial.println("PH " + String(phError > 0 ? "low" : "high") + " - Adjusting PH (K6) for " + String(phPumpDuration) + " ms");
+                
+                String phPumpCommand = "PUMP_TIMING:PH," + String(phPumpDuration);
+                Serial2.println(phPumpCommand);
+                Serial.println("Sent PH pump timing command: " + phPumpCommand);
+            }
+        } else {
+            Serial.println("Skipping EC/PH control - not at cycle time");
+        }
+    }
+    
+    // 7. ชุดทำความเย็นสารละลาย (Cooling) -> K2 (ชุดทำความเย็น)
+    // ควบคุมด้วยเงื่อนไขอุณหภูมิของสารละลาย
+    if (command == "Cooling") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on_cooling_when") || 
+            !doc["value"].containsKey("off_cooling_when")) {
+            Serial.println("⚠️ Missing required parameters for Cooling");
+            return "";
+        }
+        
+        float on_cooling_when = doc["value"]["on_cooling_when"];
+        float off_cooling_when = doc["value"]["off_cooling_when"];
+
+        Serial.println("Cooling control (K2 - ชุดทำความเย็น)");
+        Serial.println("ON when water temp >= " + String(on_cooling_when) + "°C, OFF when water temp <= " + String(off_cooling_when) + "°C");
+        Serial.println("Current water temperature: " + String(waterTemperature) + "°C");
+
+        // ใช้อุณหภูมิของสารละลาย (waterTemperature) แทนอุณหภูมิอากาศ
+        if (waterTemperature >= on_cooling_when) {
+            relayCommand.setCharAt(6 + 1, '1');
+            cooling_pump_state = true;
+            Serial.println("Turn ON cooling system (K2) - Water temperature control");
+        } else if (waterTemperature <= off_cooling_when) {
+            cooling_pump_state = false;
+            Serial.println("Turn OFF cooling system (K2)");
+        }
+    }
+    
+    // 8. ปั๊มสารละลายขึ้นรางปลูก - ตรวจสอบการไหลของสารละลาย
+    if (command == "circulation_pump") {
+        commandProcessed = true;
+        Serial.println("Circulation pump control - Always ON with flow monitoring");
+        
+        // ตรวจสอบการไหลของสารละลาย (ใช้ flow sensor)
+        if (flowRate1 <= 0.1) { // ถ้าอัตราการไหลต่ำมาก
+            Serial.println("⚠️ WARNING: Low flow rate detected! Flow rate: " + String(flowRate1) + " L/min");
+            // ส่งการแจ้งเตือน
+            String alertCommand = "FLOW_ALERT:LOW_FLOW," + String(flowRate1);
+            Serial2.println(alertCommand);
+        } else {
+            Serial.println("✅ Flow rate normal: " + String(flowRate1) + " L/min");
+        }
+        
+        // ปั๊มเปิดตลอดเวลา (ไม่ใช้ relay แต่ควบคุมแยก)
+        String pumpCommand = "CIRCULATION_PUMP:ON";
+        Serial2.println(pumpCommand);
+        Serial.println("Circulation pump: Always ON");
+    }
+    
+    // ตรวจสอบระดับน้ำ (Water Level Check)
+    if (command == "water_level_check") {
+        commandProcessed = true;
+        Serial.println("Water level monitoring");
+        Serial.println("Current water level: " + String(waterLevel) + "%");
+        
+        if (waterLevel < 20) {
+            Serial.println("⚠️ WARNING: Low water level! Level: " + String(waterLevel) + "%");
+            // ส่งการแจ้งเตือน
+            String alertCommand = "WATER_ALERT:LOW_LEVEL," + String(waterLevel);
+            Serial2.println(alertCommand);
+        } else if (waterLevel > 90) {
+            Serial.println("⚠️ WARNING: High water level! Level: " + String(waterLevel) + "%");
+            String alertCommand = "WATER_ALERT:HIGH_LEVEL," + String(waterLevel);
+            Serial2.println(alertCommand);
+        } else {
+            Serial.println("✅ Water level normal: " + String(waterLevel) + "%");
+        }
+    }
+    
+    // รวมคำสั่งไฟและ CO2 (เดิม - เพื่อความเข้ากันได้)
+    if (command == "light_co2") {
+        commandProcessed = true;
+        if (!doc.containsKey("value") || !doc["value"].containsKey("on") || 
+            !doc["value"].containsKey("off") || !doc["value"].containsKey("co2_on") || 
+            !doc["value"].containsKey("co2_off")) {
+            Serial.println("⚠️ Missing required parameters for light_co2");
+            return "";
+        }
+        
+        int light_on = doc["value"]["on"];
+        int light_off = doc["value"]["off"];
+        int co2_on = doc["value"]["co2_on"];
+        int co2_off = doc["value"]["co2_off"];
+        unsigned long currentHour = (unixTimestamp / 3600) % 24;
+
+        Serial.println("Light and CO2 control (K1-ไฟ, K8-CO2)");
+        Serial.println("Light ON: " + String(light_on) + ", Light OFF: " + String(light_off));
+        Serial.println("CO2 ON when <= " + String(co2_on) + ", CO2 OFF when >= " + String(co2_off));
+        Serial.println("Current hour: " + String(currentHour) + ", Current CO2: " + String(co2Value));
+        Serial.println("Current light level: " + String(lightValue) + " lux");
+        
+        // ตรวจสอบเงื่อนไขแสงและ CO2
+        bool lightShouldBeOn = false;
+        
+        // ตรวจสอบช่วงเวลาสำหรับไฟ
+        if (light_on < light_off) {
+            lightShouldBeOn = (currentHour >= light_on && currentHour < light_off);
+        } else {
+            lightShouldBeOn = (currentHour >= light_on || currentHour < light_off);
+        }
+        // Serial.println("lightShouldBeOn: " + lightShouldBeOn);
+        // เพิ่มเงื่อนไขความสว่าง (ถ้าแสงธรรมชาติเพียงพอก็ไม่ต้องเปิดไฟ)
+        bool needMoreLight = (lightValue < 100); // ถ้าแสงน้อยกว่า 10,000 lux
+      
+        // if (lightShouldBeOn && needMoreLight) {
+              if (lightShouldBeOn && true) {
+            relayCommand.setCharAt(6 + 0, '1');
+            light_state = true;
+            Serial.println("Turn ON light (K1) - Time & Light conditions");
+            
+            // ควบคุม CO2 เฉพาะเมื่อไฟเปิดอยู่และพัดลมระบายอากาศปิด
+            if (co2Value <= co2_on && !fan_external_state) {
+                relayCommand.setCharAt(6 + 7, '1');
+                co2_state = true;
+                Serial.println("Turn ON CO2 (K8)");
+            } else if (co2Value >= co2_off || fan_external_state) {
+                co2_state = false;
+                if (fan_external_state) {
+                    Serial.println("Turn OFF CO2 (K8) - External fan running");
+                } else {
+                    Serial.println("Turn OFF CO2 (K8) - CO2 level sufficient");
+                }
+            }
+       
+        } else {
+            light_state = false;
+            co2_state = false;
+            if (!needMoreLight) {
+                Serial.println("Turn OFF light (K1) - Natural light sufficient");
+            } else {
+                Serial.println("Turn OFF light (K1) and CO2 (K8) - Outside time range");
+            }
+        }
+    }
+    
+    // ตรวจสอบว่าคำสั่งถูกประมวลผลหรือไม่
+    if (!commandProcessed) {
+        Serial.println("⚠️ Unknown command: " + command);
+        return "";
+    }
+    
+    return relayCommand;
+}
+
+// ฟังก์ชัน callback สำหรับ BeeNeXT
+void beeNeXTCallback(String topic, String message) {
+    // ส่งข้อมูลไปแสดงบนจอ BeeNeXT
+    if (topic == "cabinets/cab_tok_001/data") {
+        // แปลง JSON message
+        StaticJsonDocument<512> displayDoc;
+        DeserializationError error = deserializeJson(displayDoc, message);
+        
+        if (!error) {
+            String sensorName = displayDoc["sensor"].as<String>();
+            String cabinetId = displayDoc["cabinet_id"].as<String>();
+            unsigned long timestamp = displayDoc["timestamp"].as<unsigned long>();
+            
+            // ส่งข้อมูลไปแสดงบนจอตามประเภทเซ็นเซอร์
+            if (sensorName == "CO2") {
+                float value = displayDoc["value"].as<float>();
+                LCD.publish("/myBeeNeXT/CO2", String(value));
+            }
+            else if (sensorName == "Light") {
+                float value = displayDoc["value"].as<float>();
+                LCD.publish("/myBeeNeXT/LIGHT", String(value));
+            }
+            else if (sensorName == "EC") {
+                float value = displayDoc["value"].as<float>();
+                LCD.publish("/myBeeNeXT/EC", String(value));
+            }
+            else if (sensorName == "Water_Level") {
+                float value = displayDoc["value"].as<float>();
+                LCD.publish("/myBeeNeXT/WATER_LEVEL", String(value));
+            }
+            else if (sensorName == "Air_Humidity_Temperature") {
+                JsonObject valueObj = displayDoc["value"].as<JsonObject>();
+                float humidity = valueObj["humidity"];
+                float temperature = valueObj["temperature"];
+                LCD.publish("/myBeeNeXT/AIR_TEMP", String(temperature));
+                LCD.publish("/myBeeNeXT/AIR_HUMIDITY", String(humidity));
+            }
+            else if (sensorName == "Water_Temp_PH") {
+                JsonObject valueObj = displayDoc["value"].as<JsonObject>();
+                float waterTemp = valueObj["temperature"];
+                float ph = valueObj["ph"];
+                LCD.publish("/myBeeNeXT/WATER_TEMP", String(waterTemp));
+                LCD.publish("/myBeeNeXT/PH", String(ph));
+            }
+            else if (sensorName == "PowerMeter") {
+                JsonObject valueObj = displayDoc["value"].as<JsonObject>();
+                float voltage = valueObj["voltage"];
+                float current = valueObj["current"];
+                float power = valueObj["power"];
+                LCD.publish("/myBeeNeXT/VOLTAGE", String(voltage));
+                LCD.publish("/myBeeNeXT/CURRENT", String(current));
+                LCD.publish("/myBeeNeXT/POWER", String(power));
+            }
+        }
+    }
+}
+
+// ฟังก์ชันสำหรับประมวลผลหลายคำสั่งพร้อมกัน
+String processMultipleCommands(JsonDocument& doc) {
+    String relayCommand = "RELAY:00000000";
+    bool hasAnyCommand = false;
+    
+    // ตรวจสอบว่าเป็น array ของคำสั่งหรือไม่
+    if (doc.containsKey("commands") && doc["commands"].is<JsonArray>()) {
+        JsonArray commands = doc["commands"].as<JsonArray>();
+        Serial.println("🔄 Processing " + String(commands.size()) + " commands simultaneously");
+        
+        for (JsonVariant commandVar : commands) {
+            if (commandVar.is<JsonObject>()) {
+                JsonObject commandObj = commandVar.as<JsonObject>();
+                
+                // สร้าง temporary document สำหรับแต่ละคำสั่ง
+                DynamicJsonDocument tempDoc(2048);
+                tempDoc.set(commandObj);
+                
+                // ประมวลผลคำสั่งแต่ละตัว
+                String singleRelayCommand = convertJsonToRelayCommand(tempDoc);
+                
+                if (singleRelayCommand != "") {
+                    hasAnyCommand = true;
+                    // รวม relay commands โดยใช้ OR operation
+                    for (int i = 0; i < 8; i++) {
+                        if (singleRelayCommand.charAt(6 + i) == '1') {
+                            relayCommand.setCharAt(6 + i, '1');
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (hasAnyCommand) {
+            Serial.println("🔗 Combined relay command: " + relayCommand);
+            return relayCommand;
+        }
+    }
+    
+    return "";
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    // แปลง payload เป็น String
+    String receivedMessage = "";
+    for (unsigned int i = 0; i < length; i++) {
+        receivedMessage += (char)payload[i];
+    }
+
+    // จัดการกรณี timesync
+    if (strcmp(topic, "timesync2") == 0) {
+        DynamicJsonDocument timeDoc(256);
+        DeserializationError error = deserializeJson(timeDoc, payload);
+        if (error) {
+            return;
+        }
+
+        if (timeDoc.containsKey("unixTimestamp")) {
+            unixTimestamp = timeDoc["unixTimestamp"].as<unsigned long>();
+            Serial.println("⏰ Received timestamp: " + String(unixTimestamp));
+        }
+
+        if (timeDoc.containsKey("timeOnly")) {
+            String timeOnlyStr = timeDoc["timeOnly"].as<String>();
+            // แปลง "16:00:11" ให้เหลือแค่ 16
+            int colonIndex = timeOnlyStr.indexOf(':');
+            if (colonIndex > 0) {
+                String hourStr = timeOnlyStr.substring(0, colonIndex);
+                timeOnly = hourStr.toInt();
+                Serial.println("⏰ Received time only hour: " + String(timeOnly));
+            }
+        }
+        return;
+    }
+
+    // จัดการข้อมูลสำหรับ BeeNeXT Display
+    char beeNeXTDataTopic[64];
+    sprintf(beeNeXTDataTopic, "cabinets/%s/data", cabinetId);
+    if (strcmp(topic, beeNeXTDataTopic) == 0) {
+        beeNeXTCallback(String(topic), receivedMessage);
+        return;
+    }
+
+    // ตรวจสอบว่าเป็น topic control ที่ถูกต้องหรือไม่
+    if (strcmp(topic, topic_control) != 0) {
+        return;
+    }
+
+    Serial.println("✅ Processing control command from correct topic: " + String(topic_control));
+
+    // Parse JSON สำหรับคำสั่งควบคุม
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        Serial.println("⚠️ Failed to parse JSON: " + String(error.f_str()));
+        return;
+    }
+
+    // ตรวจสอบว่าเป็นหลายคำสั่งพร้อมกันหรือไม่
+    if (doc.containsKey("commands") && doc["commands"].is<JsonArray>()) {
+        Serial.println("🎯 Processing multiple commands simultaneously");
+        
+        // ประมวลผลหลายคำสั่งพร้อมกัน
+        String multiRelayCommand = processMultipleCommands(doc);
+        
+        if (multiRelayCommand != "") {
+            Serial2.println(multiRelayCommand);
+            Serial.println("🔁 Sent combined relay command to Arduino Mega: " + multiRelayCommand);
+        }
+        
+        // อัปเดตการตั้งค่าสำหรับทุกคำสั่ง
+        JsonArray commands = doc["commands"].as<JsonArray>();
+        for (JsonVariant commandVar : commands) {
+            if (commandVar.is<JsonObject>()) {
+                JsonObject commandObj = commandVar.as<JsonObject>();
+                DynamicJsonDocument tempDoc(2048);
+                tempDoc.set(commandObj);
+                updateControlSettings(tempDoc);
+            }
+        }
+        
+        Serial.println("🔄 Multiple control settings updated. System will execute continuously.");
+        return;
+    }
+
+    // ตรวจสอบว่ามี command หรือไม่ (สำหรับคำสั่งเดี่ยว)
+    if (!doc.containsKey("command")) {
+        Serial.println("⚠️ JSON ไม่มีคีย์ 'command' หรือ 'commands'");
+        return;
+    }
+
+    String command = doc["command"].as<String>();
+    Serial.println("🎯 Processing command: " + command);
+
+    // กรณีเป็นคำสั่งควบคุม relay โดยตรง
+    if (command == "relay_control") {
+        Serial.println("🔁 Received relay control command");
+        
+        // สร้าง String คำสั่งสำหรับ relay แทนที่จะส่ง JSON ตรงไป
+        String relayCommand = "RELAY:";
+        
+        // ตรวจสอบว่ามีข้อมูล relays หรือไม่
+        if (doc.containsKey("relays") && doc["relays"].is<JsonArray>()) {
+            JsonArray relays = doc["relays"].as<JsonArray>();
+            
+            for (int i = 0; i < 8 && i < relays.size(); i++) {
+                int state = relays[i];
+                relayCommand += String(state);
+            }
+            
+            // เติม 0 ให้ครบ 8 ตำแหน่งถ้าข้อมูลไม่ครบ
+            while (relayCommand.length() < 14) { // "RELAY:" + 8 digits = 14 chars
+                relayCommand += "0";
+            }
+            
+            // ส่งคำสั่ง String ไปยัง Arduino Mega
+            Serial2.println(relayCommand);
+            Serial.println("🔁 Sent relay command to Arduino Mega: " + relayCommand);
+        } else {
+            Serial.println("⚠️ relay_control command missing 'relays' array");
+        }
+        return;
+    }
+
+    // อัปเดตการตั้งค่าการควบคุมจากคำสั่ง MQTT (ระบบใหม่) - ลบการเรียก convertJsonToRelayCommand ออก
+    updateControlSettings(doc);
+    
+    // ระบบจะทำงานต่อเนื่องตามการตั้งค่าที่ได้รับจาก MQTT ผ่าน executeControlLogic()
+    Serial.println("🔄 Control settings updated. System will execute continuously.");
+}
+// ฟังก์ชันสำหรับร้องขอข้อมูลจาก Arduino Mega
+void requestDataFromMega() {
+    if (millis() - lastDataRequestTime >= dataRequestInterval && megaConnected) {
+        lastDataRequestTime = millis();
+        Serial2.println("DATA_REQUEST");
+    }
+}
+
+// ฟังก์ชันสำหรับรับข้อมูลจาก Arduino Mega
+void receiveDataFromMega() {
+    if (Serial2.available() > 0) {
+        String inputString = Serial2.readStringUntil('\n');
+        inputString.trim(); // ตัดช่องว่างและตัวอักษรขึ้นบรรทัดใหม่ทิ้ง
+        
+        // ตรวจสอบว่าข้อมูลเป็น JSON หรือไม่
+        if (inputString.startsWith("{")) {
+            // เพิ่มขนาด JSON Document เป็น 1024 bytes
+            StaticJsonDocument<1024> jsonDoc;
+            DeserializationError error = deserializeJson(jsonDoc, inputString);
+            
+            if (error) {
+                // ส่งการยืนยันแม้ว่าจะมีข้อผิดพลาด (เพื่อไม่ให้ Mega รอนาน)
+                Serial2.println("JSON_ERROR");
+                return;
+            }
+            
+            // บันทึกเวลาที่ได้รับข้อมูลล่าสุดและตั้งค่าสถานะการเชื่อมต่อ
+            lastMegaComm = millis();
+            megaConnected = true;
+            
+            // ตรวจสอบประเภทข้อความ (ถ้ามี)
+            if (jsonDoc.containsKey("msgType") && jsonDoc["msgType"] == "SENSOR_DATA") {
+                // บันทึกข้อมูลเซ็นเซอร์ลงในตัวแปร
+                if (jsonDoc.containsKey("co2")) {
+                    co2Value = jsonDoc["co2"].as<int>();
+                }
+                
+                if (jsonDoc.containsKey("airTemp")) {
+                    airTemperature = jsonDoc["airTemp"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("airHumidity")) {
+                    airHumidity = jsonDoc["airHumidity"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("light")) {
+                    lightValue = jsonDoc["light"].as<unsigned long>();
+                }
+                
+                if (jsonDoc.containsKey("ec")) {
+                    ecValue = jsonDoc["ec"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("ph")) {
+                    waterPH = jsonDoc["ph"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("waterTemp")) {
+                    waterTemperature = jsonDoc["waterTemp"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("waterLevel")) {
+                    waterLevel = jsonDoc["waterLevel"].as<int>();
+                }
+                
+                // เพิ่มการอ่านข้อมูลเซ็นเซอร์ AC Power
+                if (jsonDoc.containsKey("acVoltage")) {
+                    voltage = jsonDoc["acVoltage"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("acCurrent")) {
+                    current = jsonDoc["acCurrent"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("acPower")) {
+                    power = jsonDoc["acPower"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("acEnergy")) {
+                    energy = jsonDoc["acEnergy"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("acFrequency")) {
+                    frequency = jsonDoc["acFrequency"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("acPowerFactor")) {
+                    pf = jsonDoc["acPowerFactor"].as<float>();
+                }
+
+                //เพิ่มอัตราการไหลของน้ำ
+                if (jsonDoc.containsKey("flowSensor1_LPM")) {
+                    flowRate1 = jsonDoc["flowSensor1_LPM"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("flowSensor2_LPM")) {
+                    flowRate2 = jsonDoc["flowSensor2_LPM"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("flowSensor3_LPM")) {
+                    flowRate3 = jsonDoc["flowSensor3_LPM"].as<float>();
+                }
+
+                if (jsonDoc.containsKey("flowSensor1_Liters")) {
+                    totalLiters1 = jsonDoc["flowSensor1_Liters"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("flowSensor2_Liters")) {
+                    totalLiters2 = jsonDoc["flowSensor2_Liters"].as<float>();
+                }
+                
+                if (jsonDoc.containsKey("flowSensor3_Liters")) {
+                    totalLiters3 = jsonDoc["flowSensor3_Liters"].as<float>();
+                }
+
+                hasNewSensorData = true;  // ทำเครื่องหมายว่ามีข้อมูลใหม่
+                
+                // ส่งการยืนยันกลับไปยัง Arduino Mega
+                Serial2.println("DATA_RECEIVED");
+                
+            } else {
+                Serial2.println("UNKNOWN_MSG_TYPE");
+            }
+        } 
+        // ใช้ indexOf แทน == เพื่อตรวจสอบว่าข้อความมี "MEGA_TEST" อยู่หรือไม่
+        else if (inputString.indexOf("MEGA_TEST") >= 0) {
+            // ตอบกลับการทดสอบการเชื่อมต่อ
+            Serial2.println("ESP32_OK");
+            lastMegaComm = millis();
+            megaConnected = true;
+        } else {
+            Serial2.println("INVALID_FORMAT");
+        }
+    }
+}
+
+// ฟังก์ชันตรวจสอบสถานะการเชื่อมต่อกับ Arduino Mega
+void checkMegaConnection() {
+    // ถ้าไม่ได้รับข้อมูลจาก Mega เกิน 30 วินาที ให้ถือว่าขาดการเชื่อมต่อ
+    if (millis() - lastMegaComm > 30000) {
+        if (megaConnected) {
+            megaConnected = false;
+        }
+        
+        // ทดสอบการเชื่อมต่อใหม่ทุก 5 วินาที
+        static unsigned long lastTestTime = 0;
+        if (millis() - lastTestTime > 5000) {
+            lastTestTime = millis();
+            Serial2.println("ESP32_TEST");
+        }
+    }
+}
+
+// ฟังก์ชันสำหรับส่งข้อมูลเซ็นเซอร์ทั้งหมดผ่าน MQTT (เร็วมาก)
+void publishAllSensorData() {
+    if (unixTimestamp == 0) {
+        return;
+    }
+    
+    if (!client.connected()) {
+        return;
+    }
+    
+    // ส่ง Water Level โดยไม่สนใจค่า
+    publishSensorData("Water_Level", waterLevel);
+    
+    // ส่งข้อมูลเซ็นเซอร์อย่างรวดเร็ว (ลบ debug messages เพื่อความเร็ว)
+    publishSensorData("CO2", co2Value);
+    delay(5);
+  
+    publishSensorData("Light", lightValue);
+    delay(5);
+  
+    publishSensorData("EC", ecValue);
+    delay(5);
+  
+    // Air Humidity & Temperature
+    StaticJsonDocument<256> airDoc;
+    JsonObject airData = airDoc.to<JsonObject>();
+    airData["humidity"] = airHumidity;
+    airData["temperature"] = airTemperature;
+    publishSensorDataObject("Air_Humidity_Temperature", airData);
+    delay(5);
+  
+    // Water Temp & PH
+    StaticJsonDocument<256> waterDoc;
+    JsonObject waterData = waterDoc.to<JsonObject>();
+    waterData["temperature"] = waterTemperature;
+    waterData["ph"] = waterPH;
+    publishSensorDataObject("Water_Temp_PH", waterData);
+    delay(5);
+  
+    // Power Meter
+    StaticJsonDocument<256> powerDoc;
+    JsonObject powerData = powerDoc.to<JsonObject>();
+    powerData["voltage"] = voltage;
+    powerData["current"] = current;
+    powerData["power"] = power;
+    powerData["energy"] = energy;
+    powerData["frequency"] = frequency;
+    powerData["pf"] = pf;
+    publishSensorDataObject("PowerMeter", powerData);
+    delay(5);
+  
+    // Flow Sensors
+    publishSensorData("FlowSensor1_LPM", flowRate1);
+    delay(5);
+    publishSensorData("FlowSensor2_LPM", flowRate2);
+    delay(5);
+    publishSensorData("FlowSensor3_LPM", flowRate3);
+    delay(5);
+
+    publishSensorData("FlowSensor1_Liters", totalLiters1);
+    delay(5);
+    publishSensorData("FlowSensor2_Liters", totalLiters2);
+    delay(5);
+    publishSensorData("FlowSensor3_Liters", totalLiters3);
+    delay(5);
+}
+
+// ฟังก์ชัน printSystemStatus เพื่อแสดงสถานะของระบบเป็นระยะ
+void printSystemStatus() {
+    // Function removed - not related to control commands
+}
+
+// เพิ่มตัวแปรสำหรับ Batch Processing (แบบง่าย)
+struct SimpleBatch {
+    String commands[20]; // เก็บ JSON string
+    int count;
+    unsigned long lastBatchTime;
+} commandBatch;
+
+// ฟังก์ชันเพิ่มคำสั่งเข้า batch
+void addCommandToBatch(String jsonString) {
+    if (commandBatch.count < 20) {
+        commandBatch.commands[commandBatch.count] = jsonString;
+        commandBatch.count++;
+        commandBatch.lastBatchTime = millis();
+    }
+}
+
+// ฟังก์ชันประมวลผล batch commands
+void processBatchCommands() {
+    // ประมวลผล batch ทุก 2 วินาที หรือเมื่อ batch เต็ม
+    if (commandBatch.count > 0 && 
+        (millis() - commandBatch.lastBatchTime > 2000 || commandBatch.count >= 20)) {
+        
+        Serial.println("🔄 Processing batch of " + String(commandBatch.count) + " commands");
+        
+        // ประมวลผลคำสั่งทั้งหมดใน batch
+        for (int i = 0; i < commandBatch.count; i++) {
+            DynamicJsonDocument tempDoc(2048);
+            DeserializationError error = deserializeJson(tempDoc, commandBatch.commands[i]);
+            if (!error) {
+                updateControlSettings(tempDoc);
+            }
+        }
+        
+        // รีเซ็ต batch
+        commandBatch.count = 0;
+        commandBatch.lastBatchTime = millis();
+        
+        Serial.println("✅ Batch processing completed");
+    }
+}
+
+void setup() {
+    Serial.begin(115200);  // เริ่ม Serial Monitor
+    delay(1000);
+    
+    // แสดงข้อความเริ่มต้น
+    Serial.println("\n\n=================================");
+    Serial.println("ESP32-S3-DevKitC-1 Hydroponics System");
+    Serial.println("with BeeNeXT Display Integration");
+    Serial.println("=================================");
+    
+    // ตั้งค่า Serial2 สำหรับการสื่อสารกับ Arduino Mega โดยระบุขา RX, TX ให้ชัดเจน
+    Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);  // RX=18, TX=17 (ตามที่กำหนดไว้ด้านบน)
+
+    // ล้าง buffer เริ่มต้น
+    while (Serial2.available() > 0) {
+        Serial2.read();
+    }
+
+    // ตั้งค่า Pin สำหรับอุปกรณ์ (สำรองไว้ - ไม่ใช้ในระบบปัจจุบัน)
+    // *** หมายเหตุ: ระบบใช้ relay ผ่าน Arduino Mega แทน ***
+    pinMode(fan_internal_pin, OUTPUT);
+    pinMode(fan_external_pin, OUTPUT);
+    pinMode(light_pin, OUTPUT);
+    pinMode(co2_pin, OUTPUT);
+    pinMode(agitatorPumpPin, OUTPUT); // ปั๊มกวนสาร
+    pinMode(ecPumpPin, OUTPUT);       // ปั๊ม EC
+    pinMode(phPumpPin, OUTPUT);       // ปั๊ม PH
+    pinMode(cooling_pump_pin, OUTPUT); // ปั๊มน้ำทำความเย็น (เพิ่มใหม่)
+
+    // ปิดทุกอุปกรณ์เริ่มต้น (สำรองไว้ - ไม่ใช้ในระบบปัจจุบัน)
+    digitalWrite(fan_internal_pin, LOW);
+    digitalWrite(fan_external_pin, LOW);
+    digitalWrite(light_pin, LOW);
+    digitalWrite(co2_pin, LOW);
+    digitalWrite(agitatorPumpPin, LOW);
+    digitalWrite(ecPumpPin, LOW);
+    digitalWrite(phPumpPin, LOW);
+    digitalWrite(cooling_pump_pin, LOW);
+
+    // Initialize BeeNeXT Display
+    LCD.begin(mqtt_server, mqtt_port, mqtt_username, mqtt_password, beeNeXTCallback);
+    
+    // หมายเหตุ: BeeNeXT library จะแสดง debug messages ของตัวเอง
+    // ซึ่งไม่สามารถปิดได้จากโค้ดนี้
+    
+    // Subscribe BeeNeXT topics to receive data from our own sensor publishing
+    char beeNeXTDataTopic[64];
+    sprintf(beeNeXTDataTopic, "cabinets/%s/data", cabinetId);
+    LCD.subscribe(beeNeXTDataTopic);
+    
+    beeNeXTConnected = true;
+
+    // เชื่อมต่อ WiFi แบบมีการแสดงความคืบหน้า
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    
+    // รอการเชื่อมต่อ WiFi พร้อมแสดงจุด
+    unsigned long wifiStartTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStartTime < 30000) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("✅ WiFi Connected!");
+        Serial.println("IP Address: " + WiFi.localIP().toString());
+    }
+
+    // ทดสอบการเชื่อมต่อกับ Arduino Mega
+    for (int i = 0; i < 3; i++) {  // ลองทดสอบ 3 ครั้ง
+        Serial2.println("ESP32_TEST");
+        
+        // รอการตอบกลับไม่เกิน 1 วินาที
+        unsigned long startTime = millis();
+        while (millis() - startTime < 1000) {
+            if (Serial2.available() > 0) {
+                String response = Serial2.readStringUntil('\n');
+                if (response.indexOf("MEGA_OK") >= 0) {
+                    Serial.println("✅ Arduino Mega Connected!");
+                    megaConnected = true;
+                    lastMegaComm = millis();
+                    break;
+                }
+            }
+            delay(10);
+        }
+        
+        if (megaConnected) {
+            break;
+        }
+        
+        delay(1000);
+    }
+
+    // ตั้งค่า MQTT
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(callback);
+    
+    // เชื่อมต่อ MQTT ถ้า WiFi เชื่อมต่อแล้ว
+    if (WiFi.status() == WL_CONNECTED) {
+        connectToMQTT();
+    }
+    
+    Serial.println("\n🚀 System Ready - Monitoring MQTT Control Commands");
+}
+
+void loop() {
+    currentMillis = millis();  // อัพเดตเวลาในขณะนี้
+
+    // อัพเดท BeeNeXT (สำคัญมาก!)
+    BeeNeXT.update();
+    
+    // เชื่อมต่อกับ WiFi ถ้ายังไม่เชื่อมต่อ
+    if (WiFi.status() != WL_CONNECTED) {
+        static unsigned long lastWiFiRetry = 0;
+        if (currentMillis - lastWiFiRetry >= 30000) { // พยายามเชื่อมต่อ WiFi ทุก 30 วินาที
+            lastWiFiRetry = currentMillis;
+            WiFi.begin(ssid, password);
+        }
+    } 
+    
+    // เชื่อมต่อกับ MQTT ถ้ายังไม่เชื่อมต่อ และ WiFi เชื่อมต่อแล้ว
+    if (WiFi.status() == WL_CONNECTED && !client.connected()) {
+        static unsigned long lastReconnectAttempt = 0;
+        if (currentMillis - lastReconnectAttempt >= mqttReconnectInterval) {
+            lastReconnectAttempt = currentMillis;
+            connectToMQTT();
+        }
+    }
+    
+    // เรียกฟังก์ชัน loop() บ่อยๆ เพื่อรับ MQTT messages
+    if (client.connected()) {
+        client.loop();
+    }
+    
+    // ร้องขอข้อมูลจาก Arduino Mega เป็นระยะ (เพิ่มส่วนนี้)
+    requestDataFromMega();
+    
+    // ตรวจสอบว่ามีข้อมูลจาก Arduino Mega หรือไม่
+    if (currentMillis - lastMegaDataCheckTime >= megaDataCheckInterval) {
+        lastMegaDataCheckTime = currentMillis;
+        receiveDataFromMega();
+    }
+    
+    // ตรวจสอบสถานะการเชื่อมต่อกับ Arduino Mega
+    checkMegaConnection();
+
+    // ดำเนินการควบคุมอย่างต่อเนื่องตามการตั้งค่าจาก MQTT (ระบบใหม่)
+    executeControlLogic();
+
+    // ประมวลผล batch commands
+    processBatchCommands();
+
+    // ส่งข้อมูลเซ็นเซอร์เร็วมาก ทุกๆ 200ms โดยไม่ต้องรอข้อมูลใหม่
+    if (currentMillis - lastSensorPublishTime >= sensorPublishInterval && client.connected() && unixTimestamp != 0) {
+        lastSensorPublishTime = currentMillis;
+        publishAllSensorData();
+    }
+
+    // ตรวจสอบสถานะของปั๊มกวนสาร (non-blocking)
+    if (agitatorPumpRunning && (currentMillis - agitatorPumpStartTime >= agitatorPumpDelay)) {
+        digitalWrite(agitatorPumpPin, LOW);  // ปิดปั๊มกวนสาร
+        agitatorPumpRunning = false;  // กำหนดสถานะว่าปั๊มหยุดทำงาน
+        unsigned long runTime = currentMillis - agitatorPumpStartTime;
+        Serial.println("Stop Agitator Pump after (ms): " + String(runTime));
+    }
+
+    // ตรวจสอบสถานะของปั๊ม EC (non-blocking)
+    if (ecPumpRunning && (currentMillis - ecPumpStartTime >= ecPumpDuration)) {
+        digitalWrite(ecPumpPin, LOW);  // ปิดปั๊ม EC
+        ecPumpRunning = false;  // กำหนดสถานะว่าปั๊มหยุดทำงาน
+        unsigned long runTime = currentMillis - ecPumpStartTime;
+        Serial.println("Stop EC Pump after (ms): " + String(runTime));
+    }
+
+    // ตรวจสอบสถานะของปั๊ม PH (non-blocking)
+    if (phPumpRunning && (currentMillis - phPumpStartTime >= phPumpDuration)) {
+        digitalWrite(phPumpPin, LOW);  // ปิดปั๊ม PH
+        phPumpRunning = false;  // กำหนดสถานะว่าปั๊มหยุดทำงาน
+        unsigned long runTime = currentMillis - phPumpStartTime;
+        Serial.println("Stop PH Pump after (ms): " + String(runTime));
+    }
+    
+    // หน่วงเวลาเล็กน้อยเพื่อให้ CPU ได้ทำงานอื่น (ลดลงเพื่อความเร็ว)
+    delay(1);
+}
+
